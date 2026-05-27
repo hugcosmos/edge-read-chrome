@@ -293,8 +293,7 @@ async function startReading(tabId, text) {
 
         if (!cancelled) await waitForAudioEnd();
       } catch (err) {
-        console.error("[ReadAloud]", err);
-        break;
+        console.warn("[ReadAloud] Chunk", i + 1, "failed, skipping:", err.message);
       }
     }
   }

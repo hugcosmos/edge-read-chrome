@@ -15,6 +15,7 @@
   let highlightTimer = null;
   let startTime = 0;
   let pausedElapsed = 0; // elapsed ms when paused
+  let lastHighlightIdx = -1; // track which word is highlighted to detect changes
 
   // ---- Message handling ----
 
@@ -262,6 +263,7 @@
     stopTimer();
     if (!highlightedEls.length) return;
     pausedElapsed = 0;
+    lastHighlightIdx = -1;
     startTime = Date.now();
     runTimer();
   }
@@ -298,6 +300,19 @@
 
       for (let i = 0; i < highlightedEls.length; i++) {
         highlightedEls[i].classList.toggle("readaloud-active-word", i === currentIdx);
+      }
+
+      // Scroll to follow the active word, but only when it changes
+      if (currentIdx !== lastHighlightIdx && currentIdx >= 0) {
+        lastHighlightIdx = currentIdx;
+        const el = highlightedEls[currentIdx];
+        if (el) {
+          const rect = el.getBoundingClientRect();
+          // Only scroll if the word is outside the visible middle band
+          if (rect.top < 0 || rect.bottom > window.innerHeight * 0.8) {
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        }
       }
     }, 60);
   }

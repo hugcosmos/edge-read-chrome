@@ -75,4 +75,4 @@ Popup ──sendMessage──▶ Background (service worker)
 
 ## License
 
-MIT
+GPL-3.0 — same as [edge-tts](https://github.com/rany2/edge-tts).
