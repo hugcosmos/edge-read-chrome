@@ -1,0 +1,19 @@
+/* ReadAloud - Word highlighting, Chrome Reading Mode style */
+
+.readaloud-word {
+  transition: background-color 0.12s ease, color 0.12s ease;
+  border-radius: 3px;
+  padding: 1px 0;
+}
+
+.readaloud-active-word {
+  background-color: #d3e3fd !important;
+  color: #1a1a1a !important;
+  box-shadow: 0 1px 4px rgba(26, 115, 232, 0.15);
+}
+
+/* Paragraph-level fallback (used when no boundaries available) */
+.readaloud-active {
+  background-color: #e8f0fe !important;
+  border-radius: 4px;
+}

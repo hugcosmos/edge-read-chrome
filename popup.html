@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1 class="title">ReadAloud</h1>
+
+    <label class="label" for="voice">Voice</label>
+    <select id="voice" class="select"></select>
+
+    <label class="label" for="speed">Speed: <span id="speed-val">1.0x</span></label>
+    <input type="range" id="speed" min="0.5" max="2" value="1" step="0.1" class="slider">
+
+    <div class="buttons">
+      <button id="btn-page" class="btn btn-primary">Read Page</button>
+      <button id="btn-selection" class="btn">Read Selection</button>
+      <button id="btn-stop" class="btn btn-danger">Stop</button>
+    </div>
+
+    <div id="status" class="status"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
