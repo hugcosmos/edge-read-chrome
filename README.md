@@ -75,4 +75,4 @@ Popup ──sendMessage──▶ Background (service worker)
 
 ## License
 
-GPL-3.0 — same as [edge-tts](https://github.com/rany2/edge-tts).
+This project is licensed under MIT. It depends on [edge-tts](https://github.com/rany2/edge-tts) (LGPL-3.0), which is installed separately via pip.
