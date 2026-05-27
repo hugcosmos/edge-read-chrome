@@ -1,6 +1,7 @@
 // ============================================================
 // ReadAloud - Background Service Worker
 // Native Messaging for Edge TTS + Offscreen for audio playback
+// Event-driven chunk playback (survives MV3 service worker restarts)
 // ============================================================
 
 const NATIVE_HOST = "com.readaloud.tts";
@@ -13,9 +14,27 @@ let nativeAvailable = null;
 let paused = false;
 let currentTabId = null;
 
+// Reading state — persisted to chrome.storage.session so it survives
+// service-worker termination between audio chunks.
+let readingState = null;
+// Shape: { tabId, chunks[], currentIndex, cancelled, useNative }
+
 chrome.storage.local.get(["voice", "rate"], (stored) => {
   if (stored.voice) settings.voice = stored.voice;
   if (stored.rate !== undefined) settings.rate = stored.rate;
+});
+
+// Recover reading state after an unexpected service-worker restart.
+// Guard: skip if handleAudioEnded or startReading already set readingState.
+chrome.storage.session.get("readingState", (data) => {
+  if (readingState) return;
+  if (!data.readingState || data.readingState.cancelled) {
+    if (data.readingState) chrome.storage.session.remove("readingState");
+    return;
+  }
+  readingState = data.readingState;
+  currentTabId = readingState.tabId;
+  activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
 });
 
 // ---- Native Messaging ----
@@ -84,18 +103,6 @@ function sendOffscreen(msg) {
     } catch (_) {
       resolve({});
     }
-  });
-}
-
-function waitForAudioEnd() {
-  return new Promise((resolve) => {
-    const listener = (msg) => {
-      if (msg.action === "audioEnded") {
-        chrome.runtime.onMessage.removeListener(listener);
-        resolve();
-      }
-    };
-    chrome.runtime.onMessage.addListener(listener);
   });
 }
 
@@ -180,10 +187,15 @@ chrome.commands.onCommand.addListener((command) => {
   });
 });
 
-// ---- Messages from popup ----
+// ---- Messages from popup / offscreen ----
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.action) {
+    // Offscreen reports audio finished → drive the next chunk
+    case "audioEnded":
+      handleAudioEnded();
+      return false;
+
     case "readPage":
     case "readSelection":
     case "stop":
@@ -230,7 +242,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case "getStatus":
-      sendResponse({ active: !!activeSynthesis, paused });
+      sendResponse({ active: !!(activeSynthesis || readingState), paused });
       break;
   }
 });
@@ -251,62 +263,129 @@ function doResume() {
   if (currentTabId) sendToTab(currentTabId, { action: "resumeHighlight" });
 }
 
-// ---- Core: Start / Stop Reading ----
+// ---- Core: Event-Driven Reading Loop ----
+//
+// Old approach: for-loop with await waitForAudioEnd().
+// Problem: MV3 service worker gets killed after ~30 s idle while waiting
+// for audio to finish, losing all in-flight state.
+//
+// New approach: each chunk is triggered by the "audioEnded" message.
+// State is persisted to chrome.storage.session so the worker can be
+// restarted between chunks without losing progress.
 
 async function startReading(tabId, text) {
-  stopReading(tabId);
+  await stopReading(tabId);
   currentTabId = tabId;
   paused = false;
 
   const useNative = await checkNative();
   const chunks = splitText(text, 1000);
-  let cancelled = false;
-  activeSynthesis = { cancel: () => { cancelled = true; } };
+
+  readingState = { tabId, chunks, currentIndex: 0, cancelled: false, useNative };
+  activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
+
+  await chrome.storage.session.set({ readingState });
 
   await sendToTab(tabId, { action: "start", totalChunks: chunks.length });
   await ensureOffscreen();
 
   if (useNative) {
-    for (let i = 0; i < chunks.length; i++) {
-      if (cancelled) break;
-      try {
-        const resp = await sendNative({
-          action: "synthesize",
-          text: chunks[i],
-          voice: settings.voice,
-          rate: rateToStr(settings.rate),
-        });
-        if (cancelled) break;
-
-        // Set up word spans (no timer yet)
-        await sendToTab(tabId, {
-          action: "highlight",
-          text: chunks[i],
-          boundaries: resp.boundaries || [],
-        });
-
-        // Play audio
-        await sendOffscreen({ action: "playAudio", audioBase64: resp.audio });
-
-        // Audio is playing — start the highlight timer NOW
-        await sendToTab(tabId, { action: "startHighlight" });
-
-        if (!cancelled) await waitForAudioEnd();
-      } catch (err) {
-        console.warn("[ReadAloud] Chunk", i + 1, "failed, skipping:", err.message);
-      }
-    }
+    await synthesizeAndPlayChunk();
+  } else {
+    await finishReading();
   }
-
-  if (!cancelled) await sendToTab(tabId, { action: "done" }).catch(() => {});
-  activeSynthesis = null;
-  currentTabId = null;
 }
 
-function stopReading(tabId) {
+// Synthesize the current chunk and hand off to offscreen for playback.
+// Returns immediately — audioEnded event drives the next chunk.
+async function synthesizeAndPlayChunk() {
+  if (!readingState || readingState.cancelled) { await finishReading(); return; }
+
+  const { tabId, chunks, currentIndex } = readingState;
+  if (currentIndex >= chunks.length) { await finishReading(); return; }
+
+  try {
+    const resp = await sendNative({
+      action: "synthesize",
+      text: chunks[currentIndex],
+      voice: settings.voice,
+      rate: rateToStr(settings.rate),
+    });
+
+    if (!readingState || readingState.cancelled) { await finishReading(); return; }
+
+    await sendToTab(tabId, {
+      action: "highlight",
+      text: chunks[currentIndex],
+      boundaries: resp.boundaries || [],
+    });
+
+    await sendOffscreen({ action: "playAudio", audioBase64: resp.audio });
+    await sendToTab(tabId, { action: "startHighlight" });
+
+    // Audio is playing in offscreen. The audioEnded event will call
+    // handleAudioEnded() → synthesizeAndPlayChunk() for the next chunk.
+    // Service worker can safely go idle — state is in session storage.
+  } catch (err) {
+    console.warn("[ReadAloud] Chunk", currentIndex + 1, "failed, skipping:", err.message);
+    if (readingState) {
+      readingState.currentIndex++;
+      await chrome.storage.session.set({ readingState });
+      await synthesizeAndPlayChunk();
+    }
+  }
+}
+
+// Called when offscreen reports audioEnded. Advances to next chunk.
+let audioEndedBusy = false;
+
+async function handleAudioEnded() {
+  // Prevent concurrent invocations (two audioEnded messages arriving back-to-back)
+  if (audioEndedBusy) return;
+  audioEndedBusy = true;
+  try {
+    // If service worker was restarted, recover state from session storage
+    if (!readingState) {
+      const data = await chrome.storage.session.get("readingState");
+      readingState = data.readingState || null;
+      if (readingState) {
+        currentTabId = readingState.tabId;
+        activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
+        // Reload settings (also lost on restart)
+        const stored = await chrome.storage.local.get(["voice", "rate"]);
+        if (stored.voice) settings.voice = stored.voice;
+        if (stored.rate !== undefined) settings.rate = stored.rate;
+      }
+    }
+
+    if (!readingState || readingState.cancelled) { await finishReading(); return; }
+
+    readingState.currentIndex++;
+    await chrome.storage.session.set({ readingState });
+    await synthesizeAndPlayChunk();
+  } finally {
+    audioEndedBusy = false;
+  }
+}
+
+async function finishReading() {
+  const tabId = readingState?.tabId || currentTabId;
+  readingState = null;
+  activeSynthesis = null;
+  currentTabId = null;
+  paused = false;
+  await chrome.storage.session.remove("readingState").catch(() => {});
+  if (tabId) await sendToTab(tabId, { action: "done" }).catch(() => {});
+}
+
+async function stopReading(tabId) {
+  if (readingState) readingState.cancelled = true;
   if (activeSynthesis) { activeSynthesis.cancel(); activeSynthesis = null; }
   paused = false;
   currentTabId = null;
+  readingState = null;
+  audioEndedBusy = false;
+  await chrome.storage.session.remove("readingState").catch(() => {});
   sendOffscreen({ action: "stopAudio" });
   if (tabId) sendToTab(tabId, { action: "stop" }).catch(() => {});
 }
