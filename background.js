@@ -40,16 +40,24 @@ chrome.storage.session.get("readingState", (data) => {
 // ---- Native Messaging ----
 
 function sendNative(msg, retries = 2) {
+  console.log("[ReadAloud] sendNative:", msg.action, "retries=" + retries);
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendNativeMessage(NATIVE_HOST, msg, (resp) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else if (resp && resp.error) {
-        reject(new Error("Native host error: " + resp.error));
-      } else {
-        resolve(resp);
-      }
-    });
+    try {
+      chrome.runtime.sendNativeMessage(NATIVE_HOST, msg, (resp) => {
+        const err = chrome.runtime.lastError;
+        console.log("[ReadAloud] sendNative response:", err ? "ERROR: " + err.message : "ok", resp ? ("keys=" + Object.keys(resp).join(",")) : "null");
+        if (err) {
+          reject(new Error(err.message));
+        } else if (resp && resp.error) {
+          reject(new Error("Native host error: " + resp.error));
+        } else {
+          resolve(resp);
+        }
+      });
+    } catch (e) {
+      console.error("[ReadAloud] sendNative exception:", e);
+      reject(e);
+    }
   }).catch((err) => {
     nativeAvailable = null;
     if (retries > 0) {
@@ -150,6 +158,14 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   }
 });
 
+// ---- Auto-stop when reading tab navigates away ----
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (tabId === currentTabId && changeInfo.url) {
+    stopReading(null);
+  }
+});
+
 // ---- Keyboard Shortcuts ----
 
 chrome.commands.onCommand.addListener((command) => {
@@ -229,6 +245,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "updateSettings":
       settings = { ...settings, ...msg.settings };
       chrome.storage.local.set(settings);
+      // If reading, apply voice change to next chunk immediately
+      if (readingState && msg.settings.voice) {
+        const newVoice = pickVoice(readingState.chunks[0], msg.settings.voice);
+        readingState.voice = newVoice;
+        chrome.storage.session.set({ readingState });
+      }
       sendResponse({ ok: true });
       break;
 
@@ -299,15 +321,39 @@ function doResume() {
 // State is persisted to chrome.storage.session so the worker can be
 // restarted between chunks without losing progress.
 
+// Detect if text is primarily CJK (produces larger audio per character)
+function isCJK(text) {
+  const sample = text.substring(0, 200);
+  const cjk = (sample.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) || []).length;
+  return cjk > sample.length * 0.3;
+}
+
+// Pick the right voice for the text language.
+// If user's selected voice language matches the text, use it; otherwise auto-switch.
+function pickVoice(text, userVoice) {
+  const cjk = isCJK(text);
+  const voiceLang = userVoice.substring(0, 5).toLowerCase();
+  const cjkLangs = ["zh-cn", "zh-tw", "zh-hk", "ja-jp", "ko-kr"];
+  if (cjk && cjkLangs.includes(voiceLang)) return userVoice;
+  if (!cjk && !cjkLangs.includes(voiceLang)) return userVoice;
+  if (cjk) return "zh-CN-XiaoxiaoNeural";
+  return "en-US-JennyNeural";
+}
+
 async function startReading(tabId, text) {
   await stopReading(tabId);
   currentTabId = tabId;
   paused = false;
 
   const useNative = await checkNative();
-  const chunks = splitText(text, 1000);
+  const cjk = isCJK(text);
+  // CJK text produces ~3x larger audio per char, use smaller chunks
+  // to stay under Chrome's 1MB native messaging response limit
+  const maxLen = cjk ? 300 : 1000;
+  const chunks = splitText(text, maxLen);
+  const voice = pickVoice(text, settings.voice);
 
-  readingState = { tabId, chunks, currentIndex: 0, cancelled: false, useNative };
+  readingState = { tabId, chunks, currentIndex: 0, cancelled: false, useNative, voice };
   activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
 
   await chrome.storage.session.set({ readingState });
@@ -327,14 +373,14 @@ async function startReading(tabId, text) {
 async function synthesizeAndPlayChunk() {
   if (!readingState || readingState.cancelled) { await finishReading(); return; }
 
-  const { tabId, chunks, currentIndex } = readingState;
+  const { tabId, chunks, currentIndex, voice } = readingState;
   if (currentIndex >= chunks.length) { await finishReading(); return; }
 
   try {
     const resp = await sendNative({
       action: "synthesize",
       text: chunks[currentIndex],
-      voice: settings.voice,
+      voice: voice,
       rate: rateToStr(settings.rate),
     });
 
@@ -347,12 +393,7 @@ async function synthesizeAndPlayChunk() {
     });
 
     await sendOffscreen({ action: "playAudio", audioBase64: resp.audio, boundaries: resp.boundaries || [] });
-    // Highlight timing is now driven by offscreen via audio.currentTime
-    // No need to send startHighlight — offscreen sends highlightWord updates
 
-    // Audio is playing in offscreen. The audioEnded event will call
-    // handleAudioEnded() → synthesizeAndPlayChunk() for the next chunk.
-    // Service worker can safely go idle — state is in session storage.
   } catch (err) {
     console.warn("[ReadAloud] Chunk", currentIndex + 1, "failed, skipping:", err.message);
     if (readingState) {
@@ -367,7 +408,6 @@ async function synthesizeAndPlayChunk() {
 let audioEndedBusy = false;
 
 async function handleAudioEnded() {
-  // Prevent concurrent invocations (two audioEnded messages arriving back-to-back)
   if (audioEndedBusy) return;
   audioEndedBusy = true;
   try {
@@ -378,9 +418,8 @@ async function handleAudioEnded() {
       if (readingState) {
         currentTabId = readingState.tabId;
         activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
-        // Reload settings (also lost on restart)
-        const stored = await chrome.storage.local.get(["voice", "rate"]);
-        if (stored.voice) settings.voice = stored.voice;
+        // Reload rate only — voice is stored in readingState
+        const stored = await chrome.storage.local.get(["rate"]);
         if (stored.rate !== undefined) settings.rate = stored.rate;
       }
     }
@@ -406,6 +445,8 @@ async function finishReading() {
 }
 
 async function stopReading(tabId) {
+  // Clear highlights on the OLD tab (currentTabId), not the new one
+  const oldTabId = currentTabId;
   if (readingState) readingState.cancelled = true;
   if (activeSynthesis) { activeSynthesis.cancel(); activeSynthesis = null; }
   paused = false;
@@ -414,7 +455,7 @@ async function stopReading(tabId) {
   audioEndedBusy = false;
   await chrome.storage.session.remove("readingState").catch(() => {});
   sendOffscreen({ action: "stopAudio" });
-  if (tabId) sendToTab(tabId, { action: "stop" }).catch(() => {});
+  if (oldTabId) sendToTab(oldTabId, { action: "stop" }).catch(() => {});
 }
 
 // ---- Utilities ----
@@ -422,11 +463,22 @@ async function stopReading(tabId) {
 function splitText(text, maxLen) {
   if (text.length <= maxLen) return [text];
   const chunks = [];
-  const sentences = text.match(/[^.!?\n]+[.!?\n]+|[^.!?\n]+$/g) || [text];
+  // Split on ASCII and CJK sentence terminators
+  const sentences = text.match(/[^.!?\n。！？；]+[.!?\n。！？；]+|[^.!?\n。！？；]+$/g) || [text];
   let cur = "";
   for (const s of sentences) {
-    if (cur.length + s.length > maxLen && cur.length > 0) { chunks.push(cur.trim()); cur = ""; }
-    cur += s;
+    if (cur.length + s.length > maxLen && cur.length > 0) {
+      chunks.push(cur.trim());
+      cur = "";
+    }
+    // If a single sentence still exceeds maxLen, hard-split it
+    if (s.length > maxLen) {
+      for (let i = 0; i < s.length; i += maxLen) {
+        chunks.push(s.substring(i, i + maxLen).trim());
+      }
+    } else {
+      cur += s;
+    }
   }
   if (cur.trim()) chunks.push(cur.trim());
   return chunks.length ? chunks : [text];
