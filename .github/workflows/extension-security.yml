@@ -16,6 +16,9 @@ on:
     branches: [ main ]
   workflow_dispatch:  # 允许在GitHub界面手动触发
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 # 权限配置（仅授予必要权限）
 permissions:
   contents: read
@@ -39,8 +42,6 @@ jobs:
             p/chrome-extension-security
             p/javascript
             p/security
-          # 仅报告错误级别问题
-          severity: ERROR
 
   # 2. CodeQL深度代码分析
   codeql-analyze:
@@ -61,17 +62,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 初始化CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           # 添加安全扩展查询集
           queries: +security-extended,security-and-quality
 
       - name: 自动构建代码
-        uses: github/codeql-action/autobuild@v3
+        uses: github/codeql-action/autobuild@v4
 
       - name: 运行CodeQL分析
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
 
