@@ -36,4 +36,16 @@ Alt+R is context-aware: no selection → reads full page. Already reading → pa
 
 ## License
 
-MIT. Depends on [edge-tts](https://github.com/rany2/edge-tts) (LGPL-3.0), installed separately via pip.
+This project is licensed under the [MIT License](LICENSE).
+
+### Third-Party Components
+
+| Component | License |
+|---|---|
+| [edge-tts](https://github.com/rany2/edge-tts) | [LGPL-3.0](https://github.com/rany2/edge-tts/blob/master/LICENSE) |
+
+`edge-tts` is installed and runs as a standalone process via native messaging — it is not linked or bundled with this extension.
+
+### Disclaimer
+
+The TTS voices and speech synthesis service are provided by third parties. This project does not host, distribute, or guarantee the availability of any voice models or cloud services.
