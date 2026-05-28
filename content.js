@@ -100,26 +100,6 @@
     return map;
   }
 
-  // Find the original-text substring that corresponds to a range in the normalized text
-  function normSubstring(orig, normStart, normLen) {
-    const map = buildNormMap(orig);
-    if (normStart >= map.length) return "";
-    const startOrig = map[normStart];
-    const endIdx = Math.min(normStart + normLen, map.length) - 1;
-    // End is one past the last char's original position
-    const endOrig = map[endIdx] + 1;
-    return orig.substring(startOrig, endOrig);
-  }
-
-  // Find original range [start, end) for a normalized range
-  function normRange(orig, normStart, normLen) {
-    const map = buildNormMap(orig);
-    if (normStart >= map.length) return null;
-    const startOrig = map[normStart];
-    const endIdx = Math.min(normStart + normLen, map.length) - 1;
-    const endOrig = map[endIdx] + 1;
-    return { start: startOrig, end: endOrig };
-  }
 
   // ---- Word-Level Highlighting ----
 

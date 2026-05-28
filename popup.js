@@ -101,7 +101,7 @@ function localeLabel(code) {
     "fil-PH": "Filipino", "uk-UA": "Ukrainian", "cs-CZ": "Czech",
     "el-GR": "Greek", "hu-HU": "Hungarian", "ro-RO": "Romanian",
     "sk-SK": "Slovak", "bg-BG": "Bulgarian", "hr-HR": "Croatian",
-    "ca-ES": "Catalan", "da-DK": "Danish",
+    "ca-ES": "Catalan",
   };
   return names[code] || code;
 }
