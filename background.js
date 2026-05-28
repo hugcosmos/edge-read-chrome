@@ -196,6 +196,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       handleAudioEnded();
       return false;
 
+    // Offscreen drives highlight timing via audio.currentTime
+    case "highlightWord":
+      if (currentTabId) sendToTab(currentTabId, msg).catch(() => {});
+      return false;
+
     case "readPage":
     case "readSelection":
     case "stop":
@@ -253,14 +258,12 @@ function doPause() {
   if (!activeSynthesis || paused) return;
   paused = true;
   sendOffscreen({ action: "pauseAudio" });
-  if (currentTabId) sendToTab(currentTabId, { action: "pauseHighlight" });
 }
 
 function doResume() {
   if (!activeSynthesis || !paused) return;
   paused = false;
   sendOffscreen({ action: "resumeAudio" });
-  if (currentTabId) sendToTab(currentTabId, { action: "resumeHighlight" });
 }
 
 // ---- Core: Event-Driven Reading Loop ----
@@ -320,8 +323,9 @@ async function synthesizeAndPlayChunk() {
       boundaries: resp.boundaries || [],
     });
 
-    await sendOffscreen({ action: "playAudio", audioBase64: resp.audio });
-    await sendToTab(tabId, { action: "startHighlight" });
+    await sendOffscreen({ action: "playAudio", audioBase64: resp.audio, boundaries: resp.boundaries || [] });
+    // Highlight timing is now driven by offscreen via audio.currentTime
+    // No need to send startHighlight — offscreen sends highlightWord updates
 
     // Audio is playing in offscreen. The audioEnded event will call
     // handleAudioEnded() → synthesizeAndPlayChunk() for the next chunk.

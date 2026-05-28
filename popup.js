@@ -47,11 +47,17 @@ function loadVoices(selectedVoice) {
     const voices = resp.voices || [];
     if (!voices.length) return;
 
-    // Sort: English first, then by locale, then by name
+    // Sort: Chinese & English (US/UK) first, then other English, then by locale, then by name
     voices.sort((a, b) => {
-      const aEn = a.locale.startsWith("en");
-      const bEn = b.locale.startsWith("en");
-      if (aEn !== bEn) return aEn ? -1 : 1;
+      const priority = (loc) => {
+        if (loc.startsWith("zh")) return 0;
+        if (loc === "en-US" || loc === "en-GB") return 1;
+        if (loc.startsWith("en")) return 2;
+        return 3;
+      };
+      const pa = priority(a.locale);
+      const pb = priority(b.locale);
+      if (pa !== pb) return pa - pb;
       const cmp = a.locale.localeCompare(b.locale);
       if (cmp !== 0) return cmp;
       // Female first within same locale

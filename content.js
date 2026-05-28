@@ -12,10 +12,8 @@
   window.__readaloudLoaded = true;
 
   let highlightedEls = [];
-  let highlightTimer = null;
-  let startTime = 0;
-  let pausedElapsed = 0; // elapsed ms when paused
   let lastHighlightIdx = -1; // track which word is highlighted to detect changes
+  let boundaryToSpan = {};   // boundary index → span index
 
   // ---- Message handling ----
 
@@ -41,16 +39,8 @@
           setupWordHighlights(msg.text, msg.boundaries || []);
           break;
 
-        case "startHighlight":
-          startTimer();
-          break;
-
-        case "pauseHighlight":
-          pauseTimer();
-          break;
-
-        case "resumeHighlight":
-          resumeTimer();
+        case "highlightWord":
+          applyHighlight(boundaryToSpan[msg.index]);
           break;
 
         case "error":
@@ -111,6 +101,7 @@
 
     const allSpans = [];
     const nodeWords = {}; // nodeIdx -> [{ origStart, origEnd, boundary }]
+    boundaryToSpan = {};  // boundary index → span index
 
     // Collect non-empty text nodes in document order
     const textNodes = [];
@@ -201,6 +192,7 @@
         span.dataset.offset = w.boundary.offset;
         span.dataset.duration = w.boundary.duration;
         fragment.appendChild(span);
+        boundaryToSpan[w.boundary.index] = allSpans.length;
         allSpans.push(span);
         pos = w.origEnd;
       }
@@ -223,64 +215,24 @@
     }
   }
 
-  // ---- Timer ----
+  // ---- Highlight Application (driven by offscreen via audio.currentTime) ----
 
-  function startTimer() {
-    stopTimer();
-    if (!highlightedEls.length) return;
-    pausedElapsed = 0;
-    lastHighlightIdx = -1;
-    startTime = Date.now();
-    runTimer();
-  }
+  function applyHighlight(idx) {
+    for (let i = 0; i < highlightedEls.length; i++) {
+      highlightedEls[i].classList.toggle("readaloud-active-word", i === idx);
+    }
 
-  function pauseTimer() {
-    if (!highlightTimer) return;
-    clearInterval(highlightTimer);
-    highlightTimer = null;
-    pausedElapsed += Date.now() - startTime;
-  }
-
-  function resumeTimer() {
-    if (!highlightedEls.length) return;
-    startTime = Date.now();
-    runTimer();
-  }
-
-  function stopTimer() {
-    if (highlightTimer) { clearInterval(highlightTimer); highlightTimer = null; }
-    pausedElapsed = 0;
-  }
-
-  function runTimer() {
-    highlightTimer = setInterval(() => {
-      const elapsed = pausedElapsed + (Date.now() - startTime);
-      const ticks = elapsed * 10000; // ms → 100ns ticks
-
-      let currentIdx = -1;
-      for (let i = 0; i < highlightedEls.length; i++) {
-        const off = parseInt(highlightedEls[i].dataset.offset, 10);
-        const dur = parseInt(highlightedEls[i].dataset.duration, 10);
-        if (ticks >= off && ticks < off + dur) { currentIdx = i; break; }
-      }
-
-      for (let i = 0; i < highlightedEls.length; i++) {
-        highlightedEls[i].classList.toggle("readaloud-active-word", i === currentIdx);
-      }
-
-      // Scroll to follow the active word, but only when it changes
-      if (currentIdx !== lastHighlightIdx && currentIdx >= 0) {
-        lastHighlightIdx = currentIdx;
-        const el = highlightedEls[currentIdx];
-        if (el) {
-          const rect = el.getBoundingClientRect();
-          // Only scroll if the word is outside the visible middle band
-          if (rect.top < 0 || rect.bottom > window.innerHeight * 0.8) {
-            el.scrollIntoView({ behavior: "smooth", block: "center" });
-          }
+    // Scroll to follow the active word, but only when it changes
+    if (idx !== lastHighlightIdx && idx >= 0) {
+      lastHighlightIdx = idx;
+      const el = highlightedEls[idx];
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        if (rect.top < 0 || rect.bottom > window.innerHeight * 0.8) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
         }
       }
-    }, 60);
+    }
   }
 
   // ---- Paragraph Fallback ----
@@ -309,7 +261,7 @@
   }
 
   function clearHighlight() {
-    stopTimer();
+    lastHighlightIdx = -1;
     const parents = new Set();
     for (const el of highlightedEls) {
       el.classList.remove("readaloud-active-word");
