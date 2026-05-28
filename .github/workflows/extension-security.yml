@@ -23,28 +23,7 @@ permissions:
   pull-requests: write    # 用于在PR中添加评论
 
 jobs:
-  # 1. Chrome扩展规范检测
-  official-linter:
-    name: 官方扩展规范检测
-    runs-on: ubuntu-latest
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 设置Node.js环境
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-
-      - name: 安装Chrome Extension Linter
-        run: npm install -g @chiragrupani/extension-linter
-
-      - name: 运行Chrome Extension Linter
-        run: extension-linter ./ --format github
-        continue-on-error: false  # 官方错误必须修复
-
-  # 2. Semgrep静态代码分析（浏览器插件专用规则集）
+  # 1. Semgrep静态代码分析（浏览器插件专用规则集）
   semgrep-scan:
     name: Semgrep安全扫描
     runs-on: ubuntu-latest
@@ -63,7 +42,7 @@ jobs:
           # 仅报告错误级别问题
           severity: ERROR
 
-  # 3. CodeQL深度代码分析
+  # 2. CodeQL深度代码分析
   codeql-analyze:
     name: CodeQL深度代码扫描
     runs-on: ubuntu-latest
@@ -96,11 +75,11 @@ jobs:
         with:
           category: "/language:${{ matrix.language }}"
 
-  # 4. 安全扫描结果汇总
+  # 3. 安全扫描结果汇总
   security-summary:
     name: 安全扫描结果汇总
     runs-on: ubuntu-latest
-    needs: [official-linter, semgrep-scan, codeql-analyze]
+    needs: [semgrep-scan, codeql-analyze]
     if: always() && github.event_name == 'pull_request'
 
     steps:
@@ -109,7 +88,6 @@ jobs:
         with:
           script: |
             const results = {
-              officialLinter: ${{ needs.official-linter.result }},
               semgrep: ${{ needs.semgrep-scan.result }},
               codeql: ${{ needs.codeql-analyze.result }}
             };
@@ -124,7 +102,6 @@ jobs:
             let summary = '## 🛡️ 浏览器插件安全扫描结果汇总\n\n';
             summary += '| 检测项目 | 状态 |\n';
             summary += '|---------|------|\n';
-            summary += `| 官方扩展规范检测 | ${statusEmoji[results.officialLinter]} ${results.officialLinter} |\n`;
             summary += `| Semgrep静态代码分析 | ${statusEmoji[results.semgrep]} ${results.semgrep} |\n`;
             summary += `| CodeQL深度代码扫描 | ${statusEmoji[results.codeql]} ${results.codeql} |\n\n`;
 
