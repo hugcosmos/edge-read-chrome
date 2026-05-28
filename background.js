@@ -233,12 +233,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       break;
 
     case "getVoices": {
-      checkNative()
-        .then((ok) => {
-          if (ok) sendNative({ action: "getVoices" }).then((r) => sendResponse(r || { voices: [] })).catch(() => sendResponse({ voices: [] }));
-          else sendResponse({ voices: [], nativeAvailable: false });
-        })
-        .catch(() => sendResponse({ voices: [], nativeAvailable: false }));
+      // Cache-first: return cached voices immediately, refresh in background if expired
+      chrome.storage.local.get(["voices", "voicesTs"], (data) => {
+        const now = Date.now();
+        const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+        const cached = data.voices;
+        const cacheValid = cached && cached.length && (now - (data.voicesTs || 0)) < maxAge;
+
+        if (cacheValid) {
+          sendResponse({ voices: cached });
+          return;
+        }
+
+        // No valid cache — fetch from native host
+        checkNative()
+          .then((ok) => {
+            if (ok) {
+              sendNative({ action: "getVoices" }).then((r) => {
+                const voices = r?.voices || [];
+                if (voices.length) {
+                  chrome.storage.local.set({ voices, voicesTs: Date.now() });
+                }
+                sendResponse({ voices });
+              }).catch(() => sendResponse({ voices: cached || [] }));
+            } else {
+              sendResponse({ voices: cached || [], nativeAvailable: false });
+            }
+          })
+          .catch(() => sendResponse({ voices: cached || [], nativeAvailable: false }));
+      });
       return true;
     }
 
