@@ -55,15 +55,94 @@
     return false;
   });
 
-  // ---- Text Extraction ----
+  // ---- Text Extraction (Strategy Chain) ----
+  // Each extractor returns { text, name } or null.
+  // Strategies are ordered by precision: most specific first.
+  // To add a new strategy, insert it into EXTRACTORS before body-fallback.
+
+  function extractInnerText(el) {
+    return (el.innerText || "").replace(/\s+/g, " ").trim();
+  }
+
+  const EXTRACTORS = [
+    {
+      name: "semantic",
+      run() {
+        const tags = ["article", "main", '[role="main"]'];
+        for (const t of tags) {
+          const el = document.querySelector(t);
+          if (el) {
+            const text = extractInnerText(el);
+            console.log("[ReadAloud] semantic:", t, "len=" + text.length);
+            if (text.length > 50) return { text, name: "semantic" };
+          }
+        }
+        console.log("[ReadAloud] semantic: no match");
+        return null;
+      }
+    },
+    {
+      name: "og-article",
+      run() {
+        const ogType = document.querySelector('meta[property="og:type"]');
+        console.log("[ReadAloud] og-article: og:type =", ogType ? ogType.content : "none");
+        if (!ogType || ogType.content !== "article") return null;
+        const selectors = ["#content", ".article-content", ".post-body", ".entry-content", ".note-container", ".article-detail"];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el) {
+            const text = extractInnerText(el);
+            console.log("[ReadAloud] og-article:", sel, "len=" + text.length);
+            if (text.length > 50) return { text, name: "og-article" };
+          }
+        }
+        console.log("[ReadAloud] og-article: no content container found");
+        return null;
+      }
+    },
+    {
+      name: "common-content",
+      run() {
+        const selectors = [
+          "#article-content", "#articleContent",
+          "#post-content", "#postContent",
+          "#entry-content",
+          ".article-content", ".post-content",
+          ".entry-content", ".content-body",
+          "#content", ".content"
+        ];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+          const text = extractInnerText(el);
+          console.log("[ReadAloud] common-content:", sel, "len=" + text.length);
+          if (text.length > 200) return { text, name: "common-content" };
+        }
+        console.log("[ReadAloud] common-content: no match");
+        return null;
+      }
+    },
+    {
+      name: "body-fallback",
+      run() {
+        const text = extractInnerText(document.body);
+        console.log("[ReadAloud] body-fallback: len=" + text.length);
+        return text.length > 0 ? { text, name: "body-fallback" } : null;
+      }
+    }
+  ];
 
   function extractPageText() {
-    const el =
-      document.querySelector("article") ||
-      document.querySelector("main") ||
-      document.querySelector('[role="main"]') ||
-      document.body;
-    return (el.innerText || "").replace(/\s+/g, " ").trim();
+    console.log("[ReadAloud] extractPageText start, URL:", location.href);
+    for (const extractor of EXTRACTORS) {
+      const result = extractor.run();
+      if (result) {
+        console.log("[ReadAloud] matched:", result.name, "len=" + result.text.length, "preview:", result.text.substring(0, 80));
+        return result.text;
+      }
+    }
+    console.log("[ReadAloud] all extractors failed");
+    return "";
   }
 
   // Normalize whitespace for matching: collapse all whitespace runs to single space
