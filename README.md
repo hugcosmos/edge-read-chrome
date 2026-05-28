@@ -23,6 +23,14 @@ cd edge-read-chrome
 bash install.sh
 ```
 
+The install script will install the `edge-tts` dependency and register the native messaging host. When it pauses, open Chrome and load the extension:
+
+1. Go to `chrome://extensions`
+2. Enable **Developer mode** (top right)
+3. Click **Load unpacked** and select the cloned folder
+
+Then press Enter in the terminal to finish.
+
 ## Usage
 
 | Action | How |
