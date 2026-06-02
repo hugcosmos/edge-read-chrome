@@ -8,6 +8,7 @@ Uses [edge-tts](https://github.com/rany2/edge-tts) via native messaging — not 
 
 - **Word-by-word highlighting** — synced with audio, smooth transitions
 - **50+ neural voices** — Microsoft Edge TTS voices across 30+ locales
+- **Canvas-rendered site support** — works with WeRead (微信读书) and other canvas-based book readers
 - **Speed control** — 0.5x to 2.0x
 - **Keyboard shortcuts** — Alt+R start/pause/resume, Alt+S stop
 - **Right-click context menu** — read selection or full page
@@ -61,8 +62,17 @@ semantic → og-article → common-content → body-fallback
 | `common-content` | Common content selectors (`#article-content`, `.post-content`, etc.) with 200-char threshold | Generic CMS pages |
 | `body-fallback` | `document.body.innerText` | Last resort |
 
+#### Special Site Support
+
+Some sites require custom extraction methods and bypass the strategy chain entirely:
+
+| Site | Method | Notes |
+|---|---|---|
+| **WeRead (weread.qq.com)** | Canvas fillText interception + position overlay | Injects into MAIN world to intercept `CanvasRenderingContext2D.fillText`, captures per-character coordinates for accurate highlighting |
+
 - Each strategy is independent — adding new ones doesn't affect existing behavior
 - To support a new page type: add a strategy function to the `EXTRACTORS` array in `content.js`
+- For canvas-rendered sites: inject a MAIN world script (see `weread-hook.js` pattern)
 - Existing pages: `semantic` and `body-fallback` behave identically to before the change
 
 ### Language Detection
