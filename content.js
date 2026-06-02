@@ -27,7 +27,8 @@
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     try {
       // ---- WeRead-specific handling (early return, does not affect other sites) ----
-      if (location.hostname.includes("weread.qq.com")) {
+      const host = location.hostname;
+      if (host === "weread.qq.com" || host.endsWith(".weread.qq.com")) {
         switch (msg.action) {
           case "getPageText":
             extractWereadText().then(text => sendResponse({ text }));
@@ -115,6 +116,9 @@
         resolve({ text: "", chars: [] });
       }, 2000);
       function handler(e) {
+        // Verify message comes from same window and origin
+        if (e.source !== window) return;
+        if (e.origin !== window.location.origin && e.origin !== "null") return;
         if (e.data?.type === "readaloud-weread-text") {
           clearTimeout(timeout);
           window.removeEventListener("message", handler);
