@@ -15,10 +15,52 @@
   let lastHighlightIdx = -1; // track which word is highlighted to detect changes
   let boundaryToSpan = {};   // boundary index → span index
 
+  // ---- WeRead canvas-based highlighting state ----
+  let wereadChars = null;        // [{text, x, y}, ...] one per char, matches extracted text
+  let wereadBoundaries = null;   // TTS word boundaries for current chunk
+  let wereadChunkOffset = -1;    // char index in wereadChars where current chunk starts
+  let wereadWordRanges = null;   // [{startCharIdx, endCharIdx}, ...] precomputed per boundary
+  let wereadOverlay = null;      // highlight overlay element
+
   // ---- Message handling ----
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     try {
+      // ---- WeRead-specific handling (early return, does not affect other sites) ----
+      if (location.hostname.includes("weread.qq.com")) {
+        switch (msg.action) {
+          case "getPageText":
+            extractWereadText().then(text => sendResponse({ text }));
+            return true;
+          case "getSelectedText":
+            sendResponse({ text: window.getSelection().toString().trim() });
+            return false;
+          case "start":
+            clearHighlight();
+            if (wereadOverlay) { wereadOverlay.remove(); wereadOverlay = null; }
+            wereadBoundaries = null;
+            wereadChunkOffset = -1;
+            break;
+          case "stop":
+          case "done":
+            clearHighlight();
+            removeWereadOverlay();
+            break;
+          case "highlight":
+            handleWereadHighlight(msg);
+            break;
+          case "highlightWord":
+            highlightWereadWord(msg.index);
+            break;
+          case "error":
+            console.error("[ReadAloud]", msg.error);
+            break;
+        }
+        sendResponse({ ok: true });
+        return false;
+      }
+
+      // ---- Original code for all other sites (unchanged from f8ccea4) ----
       switch (msg.action) {
         case "getPageText":
           sendResponse({ text: extractPageText() });
@@ -63,6 +105,77 @@
   function extractInnerText(el) {
     return (el.innerText || "").replace(/\s+/g, " ").trim();
   }
+
+  // ---- WeRead: async text extraction from canvas ----
+
+  async function extractWereadText() {
+    const data = await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        window.removeEventListener("message", handler);
+        resolve({ text: "", chars: [] });
+      }, 2000);
+      function handler(e) {
+        if (e.data?.type === "readaloud-weread-text") {
+          clearTimeout(timeout);
+          window.removeEventListener("message", handler);
+          resolve({ text: e.data.text || "", chars: e.data.chars || [] });
+        }
+      }
+      window.addEventListener("message", handler);
+      const s = document.createElement("script");
+      s.src = chrome.runtime.getURL("weread-read.js");
+      s.onload = () => s.remove();
+      document.head.appendChild(s);
+    });
+    const text = data.text.replace(/\n/g, "");
+    const chars = data.chars;
+    console.log("[ReadAloud] weread: text len=" + text.length + " chars len=" + chars.length);
+    if (text.length <= 50) return "";
+    // Trim to start from current viewport
+    let viewStartIdx = 0;
+    const canvas = document.querySelector("canvas[data-random]");
+    if (canvas && chars.length) {
+      const scaleY = canvas.offsetHeight > 0 ? canvas.height / canvas.offsetHeight : 1;
+      const visibleTopY = Math.max(0, -canvas.getBoundingClientRect().top);
+      const canvasVisibleTopY = visibleTopY * scaleY;
+      const found = chars.findIndex(c => c.y >= canvasVisibleTopY);
+      if (found > 0) viewStartIdx = found;
+    }
+    wereadChars = chars;
+    wereadChunkOffset = viewStartIdx;
+    return text.substring(viewStartIdx);
+  }
+
+  // ---- WeRead: highlight message handler ----
+
+  function handleWereadHighlight(msg) {
+    wereadBoundaries = msg.boundaries || [];
+    wereadWordRanges = null;
+    if (!wereadChars || !wereadBoundaries.length) return;
+    const fullFlat = wereadChars.map(c => c.text).join("");
+    const chunkOff = fullFlat.indexOf(msg.text);
+    wereadChunkOffset = chunkOff >= 0 ? chunkOff : 0;
+    // Build char ranges by searching for each boundary word in actual text
+    wereadWordRanges = [];
+    let searchFrom = wereadChunkOffset;
+    const chunkEnd = wereadChunkOffset + msg.text.length;
+    for (const b of wereadBoundaries) {
+      const wordText = b.text || "";
+      if (wordText && searchFrom < chunkEnd) {
+        const pos = fullFlat.indexOf(wordText, searchFrom);
+        if (pos >= 0 && pos < chunkEnd) {
+          wereadWordRanges.push({ startCharIdx: pos, endCharIdx: pos + wordText.length });
+          searchFrom = pos + wordText.length;
+        } else {
+          wereadWordRanges.push(null);
+        }
+      } else {
+        wereadWordRanges.push(null);
+      }
+    }
+  }
+
+  // ---- Text Extraction (Strategy Chain) for non-WeRead sites ----
 
   const EXTRACTORS = [
     {
@@ -337,6 +450,89 @@
         return;
       }
     }
+  }
+
+  // ---- WeRead Canvas Highlighting ----
+
+  function highlightWereadWord(idx) {
+    if (!wereadChars || !wereadWordRanges || idx < 0) return;
+    const range = wereadWordRanges[idx];
+    if (!range) return;
+
+    const startChar = wereadChars[range.startCharIdx];
+    const endChar = wereadChars[range.endCharIdx - 1];
+    if (!startChar || !endChar) {
+      console.log("[ReadAloud] weread highlight: char not found", idx, "range:", JSON.stringify(range), "chars:", wereadChars.length);
+      return;
+    }
+
+    // Find the canvas element
+    const canvas = document.querySelector("canvas[data-random]");
+    if (!canvas) return;
+
+    // Create overlay if needed
+    if (!wereadOverlay) {
+      wereadOverlay = document.createElement("div");
+      wereadOverlay.style.cssText =
+        "position:fixed;background:rgba(211,227,253,0.45);border-radius:3px;" +
+        "pointer-events:none;z-index:9999;transition:left 0.08s,top 0.08s,width 0.08s;";
+      document.body.appendChild(wereadOverlay);
+    }
+
+    // Position overlay over the word on the canvas using viewport coordinates
+    const cr = canvas.getBoundingClientRect();
+    // Canvas internal coords may be scaled by DPR relative to CSS size
+    const scaleX = canvas.offsetWidth > 0 ? canvas.width / canvas.offsetWidth : 1;
+    const scaleY = canvas.offsetHeight > 0 ? canvas.height / canvas.offsetHeight : 1;
+    if (idx === 0) {
+      console.log("[ReadAloud] weread overlay: canvasRect:", Math.round(cr.left), Math.round(cr.top), Math.round(cr.width), Math.round(cr.height),
+        "scale:", scaleX.toFixed(2), scaleY.toFixed(2),
+        "char[0]:", JSON.stringify(startChar),
+        "overlayPos:", Math.round(cr.left + startChar.x / scaleX), Math.round(cr.top + startChar.y / scaleY));
+    }
+    const screenX = startChar.x / scaleX;
+    const screenY = startChar.y / scaleY;
+    const endScreenX = endChar.x / scaleX;
+    // Compute line spacing from smallest Y gap between chars (actual line height)
+    let lineSpacing = 25;
+    let minGap = Infinity;
+    for (let i = 1; i < Math.min(wereadChars.length, 500); i++) {
+      const dy = wereadChars[i].y - wereadChars[i - 1].y;
+      if (dy > 8 && dy < minGap) minGap = dy;
+    }
+    if (minGap < Infinity) lineSpacing = minGap / scaleY;
+    // Position overlay: y is likely near-baseline. Center overlay on the text line.
+    // overlay covers: screenY - lineSpacing*0.35 to screenY + lineSpacing*0.35
+    const overlayH = lineSpacing * 0.75;
+    const overlayTop = cr.top + screenY - lineSpacing * 0.35;
+    if (idx === 0) {
+      console.log("[ReadAloud] weread overlay: lineSpacing=" + Math.round(lineSpacing) +
+        " screenY=" + Math.round(screenY) + " overlayH=" + Math.round(overlayH));
+    }
+
+    // position:fixed — use viewport coordinates directly
+    wereadOverlay.style.left = (cr.left + screenX - 2) + "px";
+    wereadOverlay.style.top = overlayTop + "px";
+    wereadOverlay.style.width = (endScreenX - screenX + 24) + "px";
+    wereadOverlay.style.height = overlayH + "px";
+    wereadOverlay.style.display = "block";
+
+    // Scroll the word into view if needed
+    if (overlayTop < 50 || overlayTop > window.innerHeight - 100) {
+      const pageY = window.scrollY + overlayTop;
+      window.scrollTo({ top: pageY - window.innerHeight / 3, behavior: "smooth" });
+    }
+  }
+
+  function removeWereadOverlay() {
+    if (wereadOverlay) {
+      wereadOverlay.remove();
+      wereadOverlay = null;
+    }
+    wereadBoundaries = null;
+    wereadWordRanges = null;
+    wereadChunkOffset = -1;
+    wereadChars = null;
   }
 
   function clearHighlight() {
