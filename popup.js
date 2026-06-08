@@ -12,18 +12,21 @@ const statusEl = document.getElementById("status");
 
 // ---- Init ----
 
-chrome.runtime.sendMessage({ action: "getSettings" }, (s) => {
-  if (!s) return;
-  if (s.rate !== undefined) {
-    speedSlider.value = s.rate;
-    updateSpeedLabel(s.rate);
-  }
-  loadVoices(s.voice);
+chrome.runtime.sendMessage({ action: "getActualVoice" }, (r) => {
+  const actualVoice = (r && r.voice) ? r.voice : null;
+  chrome.runtime.sendMessage({ action: "getSettings" }, (s) => {
+    if (!s) return;
+    if (s.rate !== undefined) {
+      speedSlider.value = s.rate;
+      updateSpeedLabel(s.rate);
+    }
+    loadVoices(actualVoice || s.voice);
+  });
 });
 
 // Check native host status
 chrome.runtime.sendMessage({ action: "getNativeStatus" }, (r) => {
-  if (r?.available) {
+  if (r && r.available) {
     statusEl.textContent = "Edge TTS connected";
     statusEl.className = "status info";
   } else {
@@ -127,7 +130,24 @@ speedSlider.addEventListener("input", () => {
 // ---- Voice ----
 
 voiceSelect.addEventListener("change", () => {
-  chrome.runtime.sendMessage({ action: "updateSettings", settings: { voice: voiceSelect.value } });
+  const newVoice = voiceSelect.value;
+
+  // Check if voice is compatible with current text
+  chrome.runtime.sendMessage({ action: "checkVoiceCompatible", voice: newVoice }, (r) => {
+    if (r && !r.compatible) {
+      // Not compatible - restore actual voice and show error
+      chrome.runtime.sendMessage({ action: "getActualVoice" }, (v) => {
+        if (v && v.voice) {
+          voiceSelect.value = v.voice;
+          const msg = r.textLang === "cjk" ? "中文文本需要中文语音" : "English text requires English voice";
+          setStatus(msg, "error");
+        }
+      });
+      return;
+    }
+    // Compatible - update settings
+    chrome.runtime.sendMessage({ action: "updateSettings", settings: { voice: newVoice } });
+  });
 });
 
 // ---- Buttons ----
@@ -140,7 +160,7 @@ function setStatus(text, type) {
 btnPage.addEventListener("click", () => {
   setStatus("Reading page...", "info");
   chrome.runtime.sendMessage({ action: "readPage" }, (resp) => {
-    if (resp?.error) setStatus(resp.error, "error");
+    if (resp && resp.error) setStatus(resp.error, "error");
     else window.close();
   });
 });
@@ -148,7 +168,7 @@ btnPage.addEventListener("click", () => {
 btnSelection.addEventListener("click", () => {
   setStatus("Reading selection...", "info");
   chrome.runtime.sendMessage({ action: "readSelection" }, (resp) => {
-    if (resp?.error) setStatus(resp.error, "error");
+    if (resp && resp.error) setStatus(resp.error, "error");
     else window.close();
   });
 });

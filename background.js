@@ -294,6 +294,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "getStatus":
       sendResponse({ active: !!(activeSynthesis || readingState), paused });
       break;
+
+    case "getActualVoice":
+      sendResponse({ voice: (readingState?.voice) || settings.voice });
+      break;
+
+    case "getReadingLanguage":
+      if (!readingState || !readingState.chunks.length) {
+        sendResponse({ lang: "none" });
+      } else {
+        const text = readingState.chunks[readingState.currentIndex] || "";
+        sendResponse({ lang: isCJK(text) ? "cjk" : "other" });
+      }
+      break;
+
+    case "checkVoiceCompatible": {
+      const voice = msg.voice || "";
+      const voiceLang = voice.substring(0, 5).toLowerCase();
+      const cjkLangs = ["zh-cn", "zh-tw", "zh-hk", "ja-jp", "ko-kr"];
+      const isCJKVoice = cjkLangs.includes(voiceLang);
+
+      let textLang = "none";
+      if (readingState && readingState.chunks.length) {
+        const text = readingState.chunks[readingState.currentIndex] || "";
+        textLang = isCJK(text) ? "cjk" : "other";
+      }
+
+      const compatible = textLang === "none" || (textLang === "cjk" && isCJKVoice) || (textLang === "other" && !isCJKVoice);
+      sendResponse({ compatible, textLang });
+      break;
+    }
   }
 });
 
