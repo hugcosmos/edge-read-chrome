@@ -340,18 +340,47 @@ function pickVoice(text, userVoice) {
   return "en-US-JennyNeural";
 }
 
+// Clean text for EdgeTTS compatibility.
+// Removes problematic characters that may cause TTS issues.
+// WeRead text is already clean and doesn't need preprocessing.
+function cleanTextForTTS(text, isWeRead) {
+  if (isWeRead) return text;
+  return text
+    // Remove emoji (covers common emoji ranges)
+    .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '')
+    // Replace tabs with space
+    .replace(/\t/g, ' ')
+    // Remove ampersands (won't highlight but TTS will work)
+    .replace(/&/g, '')
+    // Normalize whitespace
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function startReading(tabId, text) {
   await stopReading(tabId);
   currentTabId = tabId;
   paused = false;
 
+  // Detect WeRead to skip text cleaning (canvas text is already clean)
+  const tab = await chrome.tabs.get(tabId);
+  const url = tab?.url || "";
+  const isWeRead = url.includes("weread.qq.com");
+
   const useNative = await checkNative();
-  const cjk = isCJK(text);
+
+  // Clean text for EdgeTTS compatibility (skip WeRead)
+  const cleanedText = cleanTextForTTS(text, isWeRead);
+  if (text !== cleanedText) {
+    console.log("[ReadAloud] text cleaned, preview:", cleanedText.substring(0, 100));
+  }
+
+  const cjk = isCJK(cleanedText);
   // CJK text produces ~3x larger audio per char, use smaller chunks
   // to stay under Chrome's 1MB native messaging response limit
   const maxLen = cjk ? 300 : 1000;
-  const chunks = splitText(text, maxLen);
-  const voice = pickVoice(text, settings.voice);
+  const chunks = splitText(cleanedText, maxLen);
+  const voice = pickVoice(cleanedText, settings.voice);
 
   readingState = { tabId, chunks, currentIndex: 0, cancelled: false, useNative, voice };
   activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
