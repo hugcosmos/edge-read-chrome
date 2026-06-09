@@ -18,6 +18,8 @@ let currentTabId = null;
 // service-worker termination between audio chunks.
 let readingState = null;
 // Shape: { tabId, chunks[], currentIndex, cancelled, useNative }
+let nextChunkCache = null; // { index, audio, boundaries, voice, rate }
+let pregenId = 0; // bumped to invalidate in-flight pre-generations
 
 chrome.storage.local.get(["voice", "rate"], (stored) => {
   if (stored.voice) settings.voice = stored.voice;
@@ -245,10 +247,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "updateSettings":
       settings = { ...settings, ...msg.settings };
       chrome.storage.local.set(settings);
-      // If reading, apply voice change to next chunk immediately
-      if (readingState && msg.settings.voice) {
-        const newVoice = pickVoice(readingState.chunks[0], msg.settings.voice);
-        readingState.voice = newVoice;
+      // If reading, apply voice/rate change to next chunk immediately
+      if (readingState && (msg.settings.voice || msg.settings.rate !== undefined)) {
+        if (msg.settings.voice) {
+          const newVoice = pickVoice(readingState.chunks[0], msg.settings.voice);
+          readingState.voice = newVoice;
+        }
+        nextChunkCache = null;
+        pregenId++; // invalidate any in-flight pre-generation
         chrome.storage.session.set({ readingState });
       }
       sendResponse({ ok: true });
@@ -410,6 +416,26 @@ async function startReading(tabId, text) {
   // to stay under Chrome's 1MB native messaging response limit
   const maxLen = cjk ? 300 : 1000;
   const chunks = splitText(cleanedText, maxLen);
+
+  // Make first chunk short so audio starts playing faster.
+  // This splits the first chunk at the nearest sentence boundary.
+  if (chunks[0].length > (cjk ? 80 : 200)) {
+    const firstMax = cjk ? 80 : 200;
+    const first = chunks[0];
+    const re = /[.!?\n。！？；]/g;
+    let cut = -1;
+    let m;
+    while ((m = re.exec(first)) !== null) {
+      if (m.index >= firstMax) break;
+      cut = m.index + 1;
+    }
+    const remainder = first.substring(cut).trim();
+    if (cut > 0 && remainder) {
+      chunks[0] = first.substring(0, cut).trim();
+      chunks.splice(1, 0, remainder);
+    }
+  }
+
   const voice = pickVoice(cleanedText, settings.voice);
 
   readingState = { tabId, chunks, currentIndex: 0, cancelled: false, useNative, voice };
@@ -429,19 +455,31 @@ async function startReading(tabId, text) {
 
 // Synthesize the current chunk and hand off to offscreen for playback.
 // Returns immediately — audioEnded event drives the next chunk.
+// Uses pre-generated cache when available to eliminate inter-chunk gaps.
 async function synthesizeAndPlayChunk() {
   if (!readingState || readingState.cancelled) { await finishReading(); return; }
 
   const { tabId, chunks, currentIndex, voice } = readingState;
   if (currentIndex >= chunks.length) { await finishReading(); return; }
 
+  const rate = rateToStr(settings.rate);
+
   try {
-    const resp = await sendNative({
-      action: "synthesize",
-      text: chunks[currentIndex],
-      voice: voice,
-      rate: rateToStr(settings.rate),
-    });
+    let resp;
+    // Use pre-generated cache if it matches the current chunk
+    if (nextChunkCache && nextChunkCache.index === currentIndex &&
+        nextChunkCache.voice === voice && nextChunkCache.rate === rate) {
+      resp = nextChunkCache;
+      nextChunkCache = null;
+    } else {
+      nextChunkCache = null; // invalidate stale cache
+      resp = await sendNative({
+        action: "synthesize",
+        text: chunks[currentIndex],
+        voice: voice,
+        rate: rate,
+      });
+    }
 
     if (!readingState || readingState.cancelled) { await finishReading(); return; }
 
@@ -453,6 +491,9 @@ async function synthesizeAndPlayChunk() {
 
     await sendOffscreen({ action: "playAudio", audioBase64: resp.audio, boundaries: resp.boundaries || [] });
 
+    // Pre-generate next chunk while current audio plays
+    pregenerateNextChunk(currentIndex + 1, voice, rate);
+
   } catch (err) {
     console.warn("[ReadAloud] Chunk", currentIndex + 1, "failed, skipping:", err.message);
     if (readingState) {
@@ -461,6 +502,37 @@ async function synthesizeAndPlayChunk() {
       await synthesizeAndPlayChunk();
     }
   }
+}
+
+// Pre-generate the next chunk in the background so playback is gapless.
+function pregenerateNextChunk(nextIndex, voice, rate) {
+  if (!readingState || readingState.cancelled) return;
+  if (nextIndex >= readingState.chunks.length) return;
+
+  const myId = ++pregenId;
+  sendNative({
+    action: "synthesize",
+    text: readingState.chunks[nextIndex],
+    voice: voice,
+    rate: rate,
+  }).then((resp) => {
+    // Discard if a newer pre-generation was started (voice/rate change)
+    if (myId !== pregenId) return;
+    // Only cache if still relevant (user hasn't stopped or moved past)
+    if (readingState && !readingState.cancelled &&
+        readingState.currentIndex === nextIndex - 1) {
+      nextChunkCache = {
+        index: nextIndex,
+        audio: resp.audio,
+        boundaries: resp.boundaries || [],
+        voice,
+        rate,
+      };
+    }
+  }).catch((err) => {
+    // Pre-generation failure is non-critical; will synthesize on demand instead
+    console.warn("[ReadAloud] Pre-generate chunk", nextIndex + 1, "failed:", err.message);
+  });
 }
 
 // Called when offscreen reports audioEnded. Advances to next chunk.
@@ -496,6 +568,7 @@ async function handleAudioEnded() {
 async function finishReading() {
   const tabId = readingState?.tabId || currentTabId;
   readingState = null;
+  nextChunkCache = null;
   activeSynthesis = null;
   currentTabId = null;
   paused = false;
@@ -507,6 +580,7 @@ async function stopReading(tabId) {
   // Clear highlights on the OLD tab (currentTabId), not the new one
   const oldTabId = currentTabId;
   if (readingState) readingState.cancelled = true;
+  nextChunkCache = null;
   if (activeSynthesis) { activeSynthesis.cancel(); activeSynthesis = null; }
   paused = false;
   currentTabId = null;

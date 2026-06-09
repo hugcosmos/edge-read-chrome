@@ -6,10 +6,10 @@ Chrome launches this automatically on demand via Native Messaging.
 """
 
 import sys
+import os
 import struct
 import json
 import asyncio
-import signal
 import base64
 
 try:
@@ -102,32 +102,65 @@ async def handle(msg):
 
     return {"error": f"Unknown action: {action}"}
 
-def main():
-    # Idle timeout: exit after 5 minutes of no messages
-    def _timeout(signum, frame):
-        sys.exit(0)
 
-    signal.signal(signal.SIGALRM, _timeout)
+async def _handle_and_respond(msg):
+    """Process one message and send the response back to Chrome."""
+    try:
+        result = await handle(msg)
+    except asyncio.CancelledError:
+        # Synthesis was cancelled by a newer message — respond so
+        # Chrome's sendNativeMessage callback doesn't hang forever.
+        send_message({"error": "cancelled"})
+        return
+    except Exception as e:
+        result = {"error": str(e)}
+    try:
+        send_message(result)
+    except Exception:
+        pass
+
+
+async def main_loop():
+    """
+    Concurrent main loop: reads stdin in a background thread so that
+    a new message can cancel an in-flight synthesis immediately,
+    instead of queuing behind it.
+    """
+    loop = asyncio.get_event_loop()
+    current_task = None
 
     while True:
+        # Read stdin in a thread pool so the event loop stays responsive
         try:
-            signal.alarm(300)
-            msg = read_message()
-        except Exception:
-            break
+            msg = await asyncio.wait_for(
+                loop.run_in_executor(None, read_message),
+                timeout=300,
+            )
+        except asyncio.TimeoutError:
+            # Must force-exit: the stdin-reading thread is still blocking
+            # in the thread pool and cannot be interrupted. Normal return
+            # would hang on executor.shutdown(wait=True).
+            os._exit(0)
 
         if msg is None:
             break
 
-        try:
-            result = asyncio.run(handle(msg))
-        except Exception as e:
-            result = {"error": str(e)}
+        # Cancel in-flight synthesis — new message takes priority
+        if current_task is not None and not current_task.done():
+            current_task.cancel()
 
-        try:
-            send_message(result)
-        except Exception:
-            break
+        current_task = asyncio.create_task(_handle_and_respond(msg))
+
+    # Cleanup on exit
+    if current_task and not current_task.done():
+        current_task.cancel()
+
+
+def main():
+    try:
+        asyncio.run(main_loop())
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()

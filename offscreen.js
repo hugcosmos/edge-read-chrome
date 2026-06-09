@@ -96,7 +96,7 @@ function startHighlightTimer() {
       }
     }
 
-    if (currentIdx !== lastIdx) {
+    if (currentIdx !== lastIdx && currentIdx >= 0) {
       lastIdx = currentIdx;
       chrome.runtime.sendMessage({
         action: "highlightWord",

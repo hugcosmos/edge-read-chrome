@@ -317,16 +317,63 @@
       return;
     }
 
-    // For each word from boundaries, find it in the DOM text nodes sequentially
-    // We walk through textNodes maintaining a cursor, matching words in order
-    let walkerNodeIdx = 0; // which text node we're currently scanning
-    let walkerCharIdx = 0; // how far into that node's normalized text we've scanned
+    // Locate where this chunk starts in the DOM so we match from the
+    // correct position instead of always starting at node 0.
+    const chunkProbe = norm(text.substring(0, 40));
+    let startNodeIdx = 0;
+    let startCharIdx = 0;
+    let foundStart = false;
+    if (chunkProbe.length >= 8) {
+      const probe = chunkProbe.substring(0, 20);
+      for (let ni = 0; ni < textNodes.length && !foundStart; ni++) {
+        const nodeNorm = norm(textNodes[ni].textContent);
+        const probePos = nodeNorm.indexOf(probe);
+        if (probePos !== -1) {
+          startNodeIdx = ni;
+          startCharIdx = probePos;
+          foundStart = true;
+          break;
+        }
+        // Try sliding window across concatenated nodes for chunks that
+        // span multiple text nodes.
+        let combined = nodeNorm;
+        for (let nj = ni + 1; nj < textNodes.length && combined.length < 200; nj++) {
+          combined += " " + norm(textNodes[nj].textContent);
+          const cp = combined.indexOf(probe);
+          if (cp !== -1) {
+            // Walk back to figure out which node the match starts in
+            let walkCombined = norm(textNodes[ni].textContent);
+            if (cp < walkCombined.length) {
+              startNodeIdx = ni;
+              startCharIdx = cp;
+            } else {
+              let remaining = cp - walkCombined.length - 1; // -1 for the joining space
+              for (let nk = ni + 1; nk <= nj; nk++) {
+                const nnk = norm(textNodes[nk].textContent);
+                if (remaining < nnk.length) {
+                  startNodeIdx = nk;
+                  startCharIdx = remaining;
+                  break;
+                }
+                remaining -= nnk.length + 1; // +1 for joining space
+              }
+            }
+            foundStart = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // For each word from boundaries, find it in the DOM text nodes sequentially.
+    // Cursor only moves forward — never resets to 0.
+    let walkerNodeIdx = startNodeIdx;
+    let walkerCharIdx = startCharIdx;
 
     for (const b of boundaries) {
       const wordNorm = norm(b.text);
       if (!wordNorm) continue;
 
-      // Search from current position forward through text nodes
       let found = false;
       for (let ni = walkerNodeIdx; ni < textNodes.length; ni++) {
         const nodeNorm = norm(textNodes[ni].textContent);
@@ -334,7 +381,6 @@
         const pos = nodeNorm.indexOf(wordNorm, searchStart);
 
         if (pos !== -1) {
-          // Found the word in this text node
           const nOrig = textNodes[ni].textContent;
           const nMap = buildNormMap(nOrig);
           if (pos < nMap.length && pos + wordNorm.length - 1 < nMap.length) {
@@ -344,26 +390,20 @@
             if (!nodeWords[ni]) nodeWords[ni] = [];
             nodeWords[ni].push({ origStart, origEnd, boundary: b });
 
-            // Advance cursor past this word
             walkerNodeIdx = ni;
             walkerCharIdx = pos + wordNorm.length;
             found = true;
           }
-          break;
+          // Only break on successful match; nMap failure → continue to next node
+          if (found) break;
         }
 
-        // Didn't find in this node, move to next
         if (ni > walkerNodeIdx) {
           walkerNodeIdx = ni + 1;
           walkerCharIdx = 0;
         }
       }
-
-      if (!found) {
-        // Word not found from current position; reset cursor to scan from beginning
-        walkerNodeIdx = 0;
-        walkerCharIdx = 0;
-      }
+      // Not found → keep cursor where it is (don't reset to 0)
     }
 
     // Modify DOM: for each text node that has words, create a fragment
@@ -404,9 +444,7 @@
 
     highlightedEls = allSpans;
 
-    if (allSpans.length > 0) {
-      allSpans[0].scrollIntoView({ behavior: "smooth", block: "center" });
-    } else {
+    if (allSpans.length === 0) {
       highlightParagraph(text);
     }
   }
