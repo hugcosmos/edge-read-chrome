@@ -20,6 +20,7 @@ let readingState = null;
 // Shape: { tabId, chunks[], currentIndex, cancelled, useNative }
 let nextChunkCache = null; // { index, audio, boundaries, voice, rate }
 let pregenId = 0; // bumped to invalidate in-flight pre-generations
+let consecutiveErrors = 0;
 
 chrome.storage.local.get(["voice", "rate"], (stored) => {
   if (stored.voice) settings.voice = stored.voice;
@@ -294,7 +295,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "getNativeStatus":
-      checkNative().then((ok) => sendResponse({ available: ok })).catch(() => sendResponse({ available: false }));
+      checkNative().then((ok) => sendResponse({ available: ok, active: !!(activeSynthesis || readingState), paused })).catch(() => sendResponse({ available: false, active: false, paused: false }));
       return true;
 
     case "getStatus":
@@ -397,6 +398,7 @@ async function startReading(tabId, text) {
   await stopReading(tabId);
   currentTabId = tabId;
   paused = false;
+  consecutiveErrors = 0;
 
   // Detect WeRead to skip text cleaning (canvas text is already clean)
   const tab = await chrome.tabs.get(tabId);
@@ -492,10 +494,17 @@ async function synthesizeAndPlayChunk() {
     await sendOffscreen({ action: "playAudio", audioBase64: resp.audio, boundaries: resp.boundaries || [] });
 
     // Pre-generate next chunk while current audio plays
+    consecutiveErrors = 0;
     pregenerateNextChunk(currentIndex + 1, voice, rate);
 
   } catch (err) {
-    console.warn("[ReadAloud] Chunk", currentIndex + 1, "failed, skipping:", err.message);
+    consecutiveErrors++;
+    console.warn("[ReadAloud] Chunk", currentIndex + 1, "failed (" + consecutiveErrors + " consecutive):", err.message);
+    if (consecutiveErrors >= 3) {
+      console.error("[ReadAloud] Too many consecutive errors, stopping.");
+      await finishReading();
+      return;
+    }
     if (readingState) {
       readingState.currentIndex++;
       await chrome.storage.session.set({ readingState });

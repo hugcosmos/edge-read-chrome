@@ -14,13 +14,21 @@
     <label class="label" for="speed">Speed: <span id="speed-val">1.0x</span></label>
     <input type="range" id="speed" min="0.5" max="2" value="1" step="0.1" class="slider">
 
-    <div class="buttons">
+    <div class="buttons" id="buttons-idle">
       <button id="btn-page" class="btn btn-primary">Read Page</button>
       <button id="btn-selection" class="btn">Read Selection</button>
+    </div>
+    <div class="buttons" id="buttons-playing" style="display:none">
+      <button id="btn-pause" class="btn btn-pause">Pause</button>
       <button id="btn-stop" class="btn btn-danger">Stop</button>
     </div>
 
     <div id="status" class="status"></div>
+
+    <div class="shortcuts">
+      <span class="shortcut"><kbd>Alt+R</kbd> Play / Pause</span>
+      <span class="shortcut"><kbd>Alt+S</kbd> Stop</span>
+    </div>
   </div>
 
   <script src="popup.js"></script>

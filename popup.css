@@ -96,6 +96,51 @@ body {
   background: #fce8e6;
 }
 
+.btn-pause {
+  background: #fff;
+  color: #1a73e8;
+  border-color: #1a73e8;
+}
+
+.btn-pause:hover {
+  background: #e8f0fe;
+}
+
+.btn-resume {
+  background: #1a73e8;
+  color: #fff;
+  border-color: #1a73e8;
+}
+
+.btn-resume:hover {
+  background: #1557b0;
+}
+
+.shortcuts {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #eee;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.shortcut {
+  font-size: 11px;
+  color: #888;
+}
+
+.shortcut kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  font-size: 11px;
+  font-family: inherit;
+  background: #f0f0f0;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  color: #555;
+}
+
 .status {
   margin-top: 10px;
   font-size: 12px;

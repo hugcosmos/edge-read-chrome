@@ -7,11 +7,62 @@ const speedSlider = document.getElementById("speed");
 const speedLabel = document.getElementById("speed-val");
 const btnPage = document.getElementById("btn-page");
 const btnSelection = document.getElementById("btn-selection");
+const btnPause = document.getElementById("btn-pause");
 const btnStop = document.getElementById("btn-stop");
+const buttonsIdle = document.getElementById("buttons-idle");
+const buttonsPlaying = document.getElementById("buttons-playing");
 const statusEl = document.getElementById("status");
+
+// ---- State machine ----
+
+function showIdle(hasSelection) {
+  buttonsIdle.style.display = "";
+  buttonsPlaying.style.display = "none";
+  btnSelection.style.display = hasSelection ? "" : "none";
+}
+
+function showPlaying(paused) {
+  buttonsIdle.style.display = "none";
+  buttonsPlaying.style.display = "";
+  if (paused) {
+    btnPause.textContent = "Resume";
+    btnPause.className = "btn btn-resume";
+    setStatus("Paused");
+  } else {
+    btnPause.textContent = "Pause";
+    btnPause.className = "btn btn-pause";
+    setStatus("Reading...", "info");
+  }
+}
 
 // ---- Init ----
 
+chrome.runtime.sendMessage({ action: "getNativeStatus" }, (nr) => {
+  if (nr && nr.available) {
+    statusEl.textContent = "Edge TTS connected";
+    statusEl.className = "status info";
+  } else {
+    statusEl.textContent = "Native host not found — run install.sh first";
+    statusEl.className = "status error";
+  }
+
+  if (nr && nr.active) {
+    showPlaying(nr.paused);
+  } else {
+    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+      if (tab) {
+        chrome.tabs.sendMessage(tab.id, { action: "getSelectedText" }, (r) => {
+          const sel = (r && r.text) ? r.text.trim().length > 0 : false;
+          showIdle(sel);
+        });
+      } else {
+        showIdle(false);
+      }
+    });
+  }
+});
+
+// Load voice & speed
 chrome.runtime.sendMessage({ action: "getActualVoice" }, (r) => {
   const actualVoice = (r && r.voice) ? r.voice : null;
   chrome.runtime.sendMessage({ action: "getSettings" }, (s) => {
@@ -20,19 +71,18 @@ chrome.runtime.sendMessage({ action: "getActualVoice" }, (r) => {
       speedSlider.value = s.rate;
       updateSpeedLabel(s.rate);
     }
-    loadVoices(actualVoice || s.voice);
+    const voice = actualVoice || s.voice;
+    loadVoices(voice);
+    // Check if current voice is compatible with reading text
+    if (voice && actualVoice) {
+      chrome.runtime.sendMessage({ action: "checkVoiceCompatible", voice }, (cr) => {
+        if (cr && !cr.compatible) {
+          const msg = cr.textLang === "cjk" ? "中文文本需要中文语音，请在下拉框中切换" : "English text requires English voice, please switch";
+          setStatus(msg, "error");
+        }
+      });
+    }
   });
-});
-
-// Check native host status
-chrome.runtime.sendMessage({ action: "getNativeStatus" }, (r) => {
-  if (r && r.available) {
-    statusEl.textContent = "Edge TTS connected";
-    statusEl.className = "status info";
-  } else {
-    statusEl.textContent = "Native host not found — run install.sh first";
-    statusEl.className = "status error";
-  }
 });
 
 // ---- Voices ----
@@ -50,7 +100,6 @@ function loadVoices(selectedVoice) {
     const voices = resp.voices || [];
     if (!voices.length) return;
 
-    // Sort: Chinese & English (US/UK) first, then other English, then by locale, then by name
     voices.sort((a, b) => {
       const priority = (loc) => {
         if (loc.startsWith("zh")) return 0;
@@ -63,7 +112,6 @@ function loadVoices(selectedVoice) {
       if (pa !== pb) return pa - pb;
       const cmp = a.locale.localeCompare(b.locale);
       if (cmp !== 0) return cmp;
-      // Female first within same locale
       if (a.gender !== b.gender) return a.gender === "Female" ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
@@ -132,10 +180,8 @@ speedSlider.addEventListener("input", () => {
 voiceSelect.addEventListener("change", () => {
   const newVoice = voiceSelect.value;
 
-  // Check if voice is compatible with current text
   chrome.runtime.sendMessage({ action: "checkVoiceCompatible", voice: newVoice }, (r) => {
     if (r && !r.compatible) {
-      // Not compatible - restore actual voice and show error
       chrome.runtime.sendMessage({ action: "getActualVoice" }, (v) => {
         if (v && v.voice) {
           voiceSelect.value = v.voice;
@@ -145,7 +191,6 @@ voiceSelect.addEventListener("change", () => {
       });
       return;
     }
-    // Compatible - update settings
     chrome.runtime.sendMessage({ action: "updateSettings", settings: { voice: newVoice } });
   });
 });
@@ -161,7 +206,7 @@ btnPage.addEventListener("click", () => {
   setStatus("Reading page...", "info");
   chrome.runtime.sendMessage({ action: "readPage" }, (resp) => {
     if (resp && resp.error) setStatus(resp.error, "error");
-    else window.close();
+    else showPlaying(false);
   });
 });
 
@@ -169,10 +214,29 @@ btnSelection.addEventListener("click", () => {
   setStatus("Reading selection...", "info");
   chrome.runtime.sendMessage({ action: "readSelection" }, (resp) => {
     if (resp && resp.error) setStatus(resp.error, "error");
-    else window.close();
+    else showPlaying(false);
+  });
+});
+
+btnPause.addEventListener("click", () => {
+  const isPaused = btnPause.textContent === "Resume";
+  const action = isPaused ? "resume" : "pause";
+  chrome.runtime.sendMessage({ action }, () => {
+    if (isPaused) {
+      btnPause.textContent = "Pause";
+      btnPause.className = "btn btn-pause";
+      setStatus("Reading...", "info");
+    } else {
+      btnPause.textContent = "Resume";
+      btnPause.className = "btn btn-resume";
+      setStatus("Paused");
+    }
   });
 });
 
 btnStop.addEventListener("click", () => {
-  chrome.runtime.sendMessage({ action: "stop" }, () => setStatus("Stopped"));
+  chrome.runtime.sendMessage({ action: "stop" }, () => {
+    setStatus("Stopped");
+    showIdle(false);
+  });
 });
