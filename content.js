@@ -61,6 +61,34 @@
         return false;
       }
 
+      // ---- QQ Reading: early return for text extraction, fall through for highlighting ----
+      if (host === "book.qq.com") {
+        switch (msg.action) {
+          case "getPageText":
+            sendResponse({ text: extractQQReadText() });
+            return false;
+        }
+        // highlight, highlightWord, start, stop, done → fall through to generic handling
+      }
+
+      // ---- Tianya: early return for text extraction, fall through for highlighting ----
+      if (host === "tianya.net" || host.endsWith(".tianya.net")) {
+        switch (msg.action) {
+          case "getPageText":
+            sendResponse({ text: extractTianyaText() });
+            return false;
+        }
+      }
+
+      // ---- Douban: early return for text extraction, fall through for highlighting ----
+      if (host === "www.douban.com") {
+        switch (msg.action) {
+          case "getPageText":
+            sendResponse({ text: extractDoubanText() });
+            return false;
+        }
+      }
+
       // ---- Original code for all other sites (unchanged from f8ccea4) ----
       switch (msg.action) {
         case "getPageText":
@@ -177,6 +205,51 @@
         wereadWordRanges.push(null);
       }
     }
+  }
+
+  // ---- QQ Reading: extract #article body only ----
+
+  function extractQQReadText() {
+    const el = document.querySelector("#article");
+    if (el) {
+      const text = extractInnerText(el);
+      if (text.length > 0) return text;
+    }
+    return extractPageText(); // fallback to strategy chain
+  }
+
+  // ---- Tianya: extract title + post content, skip metadata ----
+
+  function extractTianyaText() {
+    const parts = [];
+    // Title
+    const h1 = document.querySelector("h1.post-title");
+    if (h1) parts.push(h1.textContent.trim());
+    // Main post + all replies: only .post-rich-text-body (skip .action-buttons)
+    const bodies = document.querySelectorAll(".post-rich-text-body");
+    for (const body of bodies) {
+      const t = extractInnerText(body);
+      if (t) parts.push(t);
+    }
+    if (parts.length > 0) return parts.join("\n");
+    return extractPageText(); // fallback
+  }
+
+  // ---- Douban: extract title + note body, skip author/time/copyright/likes ----
+
+  function extractDoubanText() {
+    const parts = [];
+    // Title
+    const h1 = document.querySelector(".note-header h1");
+    if (h1) parts.push(h1.textContent.trim());
+    // Note body: only #link-report .note (pure text, no metadata)
+    const noteBody = document.querySelector("#link-report .note");
+    if (noteBody) {
+      const t = extractInnerText(noteBody);
+      if (t) parts.push(t);
+    }
+    if (parts.length > 0) return parts.join("\n");
+    return extractPageText(); // fallback
   }
 
   // ---- Text Extraction (Strategy Chain) for non-WeRead sites ----
