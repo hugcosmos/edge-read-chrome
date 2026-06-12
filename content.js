@@ -322,16 +322,14 @@
     const chunkProbe = norm(text.substring(0, 40));
     let startNodeIdx = 0;
     let startCharIdx = 0;
-    let foundStart = false;
     if (chunkProbe.length >= 8) {
       const probe = chunkProbe.substring(0, 20);
-      for (let ni = 0; ni < textNodes.length && !foundStart; ni++) {
+      for (let ni = 0; ni < textNodes.length; ni++) {
         const nodeNorm = norm(textNodes[ni].textContent);
         const probePos = nodeNorm.indexOf(probe);
         if (probePos !== -1) {
           startNodeIdx = ni;
           startCharIdx = probePos;
-          foundStart = true;
           break;
         }
         // Try sliding window across concatenated nodes for chunks that
@@ -358,7 +356,6 @@
                 remaining -= nnk.length + 1; // +1 for joining space
               }
             }
-            foundStart = true;
             break;
           }
         }

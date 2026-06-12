@@ -402,8 +402,11 @@ async function startReading(tabId, text) {
 
   // Detect WeRead to skip text cleaning (canvas text is already clean)
   const tab = await chrome.tabs.get(tabId);
-  const url = tab?.url || "";
-  const isWeRead = url.includes("weread.qq.com");
+  let isWeRead = false;
+  try {
+    const host = new URL(tab?.url || "").hostname;
+    isWeRead = host === "weread.qq.com" || host.endsWith(".weread.qq.com");
+  } catch (_) { /* invalid URL */ }
 
   const useNative = await checkNative();
 
