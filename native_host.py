@@ -165,6 +165,16 @@ async def main_loop():
             os._exit(0)
 
         if msg is None:
+            # stdin closed (Chrome recycled the host). If a synthesis is still
+            # in flight, let it finish and send the real result rather than
+            # cancelling — a cancel surfaces as {"error":"cancelled"} which the
+            # extension treats as a playback failure. Bounded wait so a hung
+            # task can't keep the host alive indefinitely.
+            if current_task is not None and not current_task.done():
+                try:
+                    await asyncio.wait_for(current_task, timeout=30)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    current_task.cancel()
             break
 
         # Only a new synthesis request is allowed to preempt an in-flight one.
@@ -179,10 +189,6 @@ async def main_loop():
             current_task.cancel()
 
         current_task = asyncio.create_task(_handle_and_respond(msg))
-
-    # Cleanup on exit
-    if current_task and not current_task.done():
-        current_task.cancel()
 
 
 def main():
