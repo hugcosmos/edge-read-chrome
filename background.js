@@ -616,6 +616,18 @@ async function synthesizeAndPlayChunk() {
       throw new Error("No audio in response");
     }
 
+    // Empty audio (Edge TTS returns "" for punctuation-only / whitespace
+    // chunks): a zero-length Audio won't fire onended, which would deadlock
+    // playback waiting for audioEnded that never comes. Skip playback
+    // entirely and advance immediately, same as a normal audioEnded.
+    if (resp.audio.length === 0) {
+      console.log("[ReadAloud] synthesize: empty audio for chunk " + currentIndex + ", skipping playback");
+      readingState.currentIndex++;
+      await chrome.storage.session.set({ readingState });
+      await synthesizeAndPlayChunk();
+      return;
+    }
+
     console.log("[ReadAloud] synthesize: sending highlight + playAudio for chunk " + currentIndex);
     await sendToTab(tabId, {
       action: "highlight",
