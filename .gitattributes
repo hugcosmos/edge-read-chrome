@@ -1,0 +1,9 @@
+# Normalize line endings (LF) for these text/script files.
+native_host.py text eol=lf
+install.sh    text eol=lf
+*.js          text eol=lf
+*.json        text eol=lf
+*.py          text eol=lf
+*.html        text eol=lf
+*.css         text eol=lf
+*.md          text eol=lf
