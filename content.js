@@ -37,6 +37,18 @@
   // chapter when the reader reaches a new section heading.
 
 
+  // ---- SPA route change detection ----
+  // history.pushState/replaceState (used by WeRead chapter nav, Zhihu, etc.)
+  // does NOT trigger chrome.tabs.onUpdated with changeInfo.url, so background
+  // can't auto-stop on its own. Poll location.href and notify it instead.
+  let lastUrl = location.href;
+  setInterval(() => {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      try { chrome.runtime.sendMessage({ action: "urlChanged" }); } catch (_) {}
+    }
+  }, 1500);
+
   // ---- Message handling ----
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -181,12 +193,19 @@
   // Extract text for the current chapter. WeRead renders the chapter lazily
   // over a few seconds (all canvases eventually appear in the buffer). We poll
   // until the buffer stops growing, then return the full text.
+  //
+  // extractSeq guards against concurrent calls (e.g. user re-clicks read
+  // before a previous extraction finished): a newer call bumps extractSeq, so
+  // stale in-flight extractions bail out instead of overwriting wereadChars.
+  let extractSeq = 0;
   async function extractWereadText() {
+    const mySeq = ++extractSeq;
     let bestChars = [];
     let bestLen = 0;
     let stableCount = 0;
     // Poll up to ~15s. Stop when buffer hasn't grown for 2 consecutive checks.
     for (let i = 0; i < 12; i++) {
+      if (mySeq !== extractSeq) return "";   // superseded by a newer extraction
       const data = await fetchCapturedText();
       const chars = data.chars || [];
       console.log("[ReadAloud] weread: poll " + i + " chars=" + chars.length +
@@ -202,6 +221,7 @@
       }
       await new Promise(r => setTimeout(r, 1200));
     }
+    if (mySeq !== extractSeq) return "";     // final check before writing globals
     if (bestLen <= 50) {
       console.log("[ReadAloud] weread: no text after polling (" + bestLen + " chars)");
       return "";
@@ -656,11 +676,12 @@
     // Find the canvas element that owns this character. WeRead stacks one
     // canvas per page; without resolving the owning canvas, a word on page 2+
     // would be positioned against page 1's rect and snap to the top.
-    const ci = (startChar.ci !== undefined) ? startChar.ci : 0;
-    let canvas = (ci === 0)
-      ? document.querySelector("canvas[data-ra-cidx]")
-      : document.querySelector('canvas[data-ra-cidx="' + ci + '"]');
-    if (!canvas) canvas = document.querySelector("canvas[data-random]");
+    // Resolve by cid (canvas unique id), NOT ci (positional index = sorted cid
+    // order): ci and DOM order can diverge after re-render/turn, so matching
+    // 'data-ra-cidx="<ci>"' would pick the wrong page. data-ra-cid is stable.
+    const cid = (startChar.cid !== undefined) ? (startChar.cid >>> 0) : 0;
+    let canvas = document.querySelector('canvas[data-ra-cid="' + cid + '"]');
+    if (!canvas) canvas = document.querySelector("canvas[data-ra-cid]");
     if (!canvas) return;
 
     // Create overlay if needed
@@ -680,7 +701,7 @@
     if (idx === 0) {
       console.log("[ReadAloud] weread overlay: canvasRect:", Math.round(cr.left), Math.round(cr.top), Math.round(cr.width), Math.round(cr.height),
         "scale:", scaleX.toFixed(2), scaleY.toFixed(2),
-        "ci:", ci,
+        "cid:", cid,
         "char[0]:", JSON.stringify(startChar),
         "overlayPos:", Math.round(cr.left + startChar.x / scaleX), Math.round(cr.top + startChar.y / scaleY));
     }

@@ -244,6 +244,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "keepalive":
       return false;
 
+    // Content script reports an SPA route change (history.pushState) that
+    // tabs.onUpdated wouldn't fire with changeInfo.url. Stop reading on the
+    // current tab so audio doesn't desync from the new page content.
+    case "urlChanged":
+      if (sender.tab && sender.tab.id === currentTabId) stopReading(null);
+      return false;
+
     case "readPage":
     case "readSelection":
     case "stop":
