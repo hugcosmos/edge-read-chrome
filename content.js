@@ -10,17 +10,32 @@
 
   if (window.__readaloudLoaded) return;
   window.__readaloudLoaded = true;
+  console.log("[ReadAloud] content.js v20260614-preScroll LOADED on " + location.hostname);
 
   let highlightedEls = [];
   let lastHighlightIdx = -1; // track which word is highlighted to detect changes
   let boundaryToSpan = {};   // boundary index → span index
 
   // ---- WeRead canvas-based highlighting state ----
-  let wereadChars = null;        // [{text, x, y}, ...] one per char, matches extracted text
+  let wereadChars = null;        // [{text, x, y, ci}, ...] one per char, matches extracted text
   let wereadBoundaries = null;   // TTS word boundaries for current chunk
   let wereadChunkOffset = -1;    // char index in wereadChars where current chunk starts
   let wereadWordRanges = null;   // [{startCharIdx, endCharIdx}, ...] precomputed per boundary
+  let wereadCanvasDims = null;   // { w, h } of canvas at capture time — used to detect re-render
   let wereadOverlay = null;      // highlight overlay element
+  let wereadCursorOffset = 0;    // forward-only cursor: end char offset of last matched chunk
+
+  // ---- WeRead: detect chapter switch (posted from hook in MAIN world) ----
+  // When the hook detects canvas-set replacement, it clears its capture buffer
+  // and posts this event. We stop any active reading so the user must re-click
+  // ---- WeRead: no chapter-switch polling here ----
+  // The hook filters chars by canvas-presence-in-DOM (data-ra-cid), which
+  // correctly handles real chapter switches (entire canvas set replaced)
+  // without false positives from in-chapter section-title changes. We do NOT
+  // poll the title element: .readerTopBar_title_chapter updates on every
+  // section within a chapter, so polling it would interrupt reading mid-
+  // chapter when the reader reaches a new section heading.
+
 
   // ---- Message handling ----
 
@@ -41,6 +56,7 @@
             if (wereadOverlay) { wereadOverlay.remove(); wereadOverlay = null; }
             wereadBoundaries = null;
             wereadChunkOffset = -1;
+            wereadCursorOffset = 0;
             break;
           case "stop":
           case "done":
@@ -137,14 +153,15 @@
 
   // ---- WeRead: async text extraction from canvas ----
 
-  async function extractWereadText() {
-    const data = await new Promise((resolve) => {
+  // Inject weread-read.js once and resolve with {text, chars} from the hook's
+  // __RA_GET_TEXT. Returns chars for canvases currently in the DOM.
+  function fetchCapturedText() {
+    return new Promise((resolve) => {
       const timeout = setTimeout(() => {
         window.removeEventListener("message", handler);
         resolve({ text: "", chars: [] });
       }, 2000);
       function handler(e) {
-        // Verify message comes from same window and origin
         if (e.source !== window) return;
         if (e.origin !== window.location.origin && e.origin !== "null") return;
         if (e.data?.type === "readaloud-weread-text") {
@@ -159,34 +176,89 @@
       s.onload = () => s.remove();
       document.head.appendChild(s);
     });
-    const text = data.text.replace(/\n/g, "");
-    const chars = data.chars;
-    console.log("[ReadAloud] weread: text len=" + text.length + " chars len=" + chars.length);
-    if (text.length <= 50) return "";
-    // Trim to start from current viewport
-    let viewStartIdx = 0;
-    const canvas = document.querySelector("canvas[data-random]");
-    if (canvas && chars.length) {
-      const scaleY = canvas.offsetHeight > 0 ? canvas.height / canvas.offsetHeight : 1;
-      const visibleTopY = Math.max(0, -canvas.getBoundingClientRect().top);
-      const canvasVisibleTopY = visibleTopY * scaleY;
-      const found = chars.findIndex(c => c.y >= canvasVisibleTopY);
-      if (found > 0) viewStartIdx = found;
-    }
-    wereadChars = chars;
-    wereadChunkOffset = viewStartIdx;
-    return text.substring(viewStartIdx);
   }
+
+  // Extract text for the current chapter. WeRead renders the chapter lazily
+  // over a few seconds (all canvases eventually appear in the buffer). We poll
+  // until the buffer stops growing, then return the full text.
+  async function extractWereadText() {
+    let bestChars = [];
+    let bestLen = 0;
+    let stableCount = 0;
+    // Poll up to ~15s. Stop when buffer hasn't grown for 2 consecutive checks.
+    for (let i = 0; i < 12; i++) {
+      const data = await fetchCapturedText();
+      const chars = data.chars || [];
+      console.log("[ReadAloud] weread: poll " + i + " chars=" + chars.length +
+        " best=" + bestLen);
+      if (chars.length > bestLen) {
+        bestChars = chars;
+        bestLen = chars.length;
+        stableCount = 0;
+      } else {
+        stableCount++;
+        // Buffer stable for 2 checks AND we have enough text → done
+        if (stableCount >= 2 && bestLen > 100) break;
+      }
+      await new Promise(r => setTimeout(r, 1200));
+    }
+    if (bestLen <= 50) {
+      console.log("[ReadAloud] weread: no text after polling (" + bestLen + " chars)");
+      return "";
+    }
+    wereadChars = bestChars;
+    wereadChunkOffset = 0;
+    wereadCursorOffset = 0;
+    wereadCanvasDims = (() => {
+      const c = document.querySelector("canvas[data-ra-cidx]");
+      return c ? { w: c.offsetWidth, h: c.offsetHeight } : null;
+    })();
+    console.log("[ReadAloud] weread: extracted " + bestLen + " chars");
+    return bestChars.map(c => c.text).join("");
+  }
+
+
 
   // ---- WeRead: highlight message handler ----
 
   function handleWereadHighlight(msg) {
     wereadBoundaries = msg.boundaries || [];
     wereadWordRanges = null;
-    if (!wereadChars || !wereadBoundaries.length) return;
+    if (!wereadBoundaries.length) return;
+    if (!wereadChars) return;
+
     const fullFlat = wereadChars.map(c => c.text).join("");
-    const chunkOff = fullFlat.indexOf(msg.text);
-    wereadChunkOffset = chunkOff >= 0 ? chunkOff : 0;
+    // Forward-only cursor: search from where the previous chunk ended.
+    // CJK pages contain many repeated phrases; indexOf would otherwise keep
+    // matching the earliest occurrence and snap the overlay back to the top.
+    let chunkOff = fullFlat.indexOf(msg.text, wereadCursorOffset);
+    // Fall back to a fresh search only if the cursor overshoots the text end
+    // (e.g. after a re-extraction trimmed wereadChars). Never fall back to 0
+    // unconditionally — that would re-read from page top.
+    if (chunkOff < 0 && wereadCursorOffset > 0) {
+      chunkOff = fullFlat.indexOf(msg.text, 0);
+      if (chunkOff >= 0) wereadCursorOffset = 0;
+    }
+    console.log("[ReadAloud] weread highlight: fullFlat len=" + fullFlat.length +
+      " chunkText len=" + msg.text.length +
+      " chunkOff=" + chunkOff +
+      " cursor=" + wereadCursorOffset +
+      " charsStored=" + wereadChars.length +
+      " chunkPreview=\"" + msg.text.substring(0, 40) + "\"");
+
+    // Not found: skip this chunk's highlight entirely rather than anchoring
+    // to offset 0 (page top). Cursor stays put so the next chunk can still
+    // match forward from here.
+    if (chunkOff < 0) {
+      console.warn("[ReadAloud] weread highlight: chunk not found, skipping (cursor=" +
+        wereadCursorOffset + ")");
+      return;
+    }
+
+    wereadChunkOffset = chunkOff;
+    // Advance cursor past this chunk so the next indexOf cannot rematch it.
+    wereadCursorOffset = chunkOff + msg.text.length;
+
     // Build char ranges by searching for each boundary word in actual text
     wereadWordRanges = [];
     let searchFrom = wereadChunkOffset;
@@ -395,14 +467,16 @@
     const chunkProbe = norm(text.substring(0, 40));
     let startNodeIdx = 0;
     let startCharIdx = 0;
+    let foundStart = false;
     if (chunkProbe.length >= 8) {
       const probe = chunkProbe.substring(0, 20);
-      for (let ni = 0; ni < textNodes.length; ni++) {
+      for (let ni = 0; ni < textNodes.length && !foundStart; ni++) {
         const nodeNorm = norm(textNodes[ni].textContent);
         const probePos = nodeNorm.indexOf(probe);
         if (probePos !== -1) {
           startNodeIdx = ni;
           startCharIdx = probePos;
+          foundStart = true;
           break;
         }
         // Try sliding window across concatenated nodes for chunks that
@@ -429,6 +503,7 @@
                 remaining -= nnk.length + 1; // +1 for joining space
               }
             }
+            foundStart = true;
             break;
           }
         }
@@ -578,8 +653,14 @@
       return;
     }
 
-    // Find the canvas element
-    const canvas = document.querySelector("canvas[data-random]");
+    // Find the canvas element that owns this character. WeRead stacks one
+    // canvas per page; without resolving the owning canvas, a word on page 2+
+    // would be positioned against page 1's rect and snap to the top.
+    const ci = (startChar.ci !== undefined) ? startChar.ci : 0;
+    let canvas = (ci === 0)
+      ? document.querySelector("canvas[data-ra-cidx]")
+      : document.querySelector('canvas[data-ra-cidx="' + ci + '"]');
+    if (!canvas) canvas = document.querySelector("canvas[data-random]");
     if (!canvas) return;
 
     // Create overlay if needed
@@ -599,6 +680,7 @@
     if (idx === 0) {
       console.log("[ReadAloud] weread overlay: canvasRect:", Math.round(cr.left), Math.round(cr.top), Math.round(cr.width), Math.round(cr.height),
         "scale:", scaleX.toFixed(2), scaleY.toFixed(2),
+        "ci:", ci,
         "char[0]:", JSON.stringify(startChar),
         "overlayPos:", Math.round(cr.left + startChar.x / scaleX), Math.round(cr.top + startChar.y / scaleY));
     }
@@ -617,9 +699,14 @@
     // overlay covers: screenY - lineSpacing*0.35 to screenY + lineSpacing*0.35
     const overlayH = lineSpacing * 0.75;
     const overlayTop = cr.top + screenY - lineSpacing * 0.35;
-    if (idx === 0) {
-      console.log("[ReadAloud] weread overlay: lineSpacing=" + Math.round(lineSpacing) +
-        " screenY=" + Math.round(screenY) + " overlayH=" + Math.round(overlayH));
+    if (idx <= 2) {
+      console.log("[ReadAloud] weread overlay idx=" + idx +
+        " charIdx=" + range.startCharIdx +
+        " screenY=" + Math.round(screenY) +
+        " overlayTop=" + Math.round(overlayTop) +
+        " canvasTop=" + Math.round(cr.top) +
+        " canvasH=" + Math.round(cr.height) +
+        " scrollTo=" + (overlayTop < 50 || overlayTop > window.innerHeight - 100));
     }
 
     // position:fixed — use viewport coordinates directly
@@ -645,6 +732,8 @@
     wereadWordRanges = null;
     wereadChunkOffset = -1;
     wereadChars = null;
+    wereadCanvasDims = null;
+    wereadCursorOffset = 0;
   }
 
   function clearHighlight() {

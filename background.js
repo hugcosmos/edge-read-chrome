@@ -27,6 +27,21 @@ chrome.storage.local.get(["voice", "rate"], (stored) => {
   if (stored.rate !== undefined) settings.rate = stored.rate;
 });
 
+// Keep the native host's stdin fed while a reading session is active so it
+// does not hit its idle timeout (and os._exit) during long playback. Alarms
+// survive MV3 service-worker restarts, unlike setInterval in the offscreen.
+chrome.alarms.get("native-keepalive", (a) => {
+  if (!a) chrome.alarms.create("native-keepalive", { periodInMinutes: 2 });
+});
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== "native-keepalive") return;
+  // Only ping while actively reading and not paused; a paused session
+  // intentionally lets the host idle (resume will re-establish it).
+  if (readingState && !readingState.cancelled && !paused) {
+    sendNative({ action: "ping" }).catch(() => {});
+  }
+});
+
 // Recover reading state after an unexpected service-worker restart.
 // Guard: skip if handleAudioEnded or startReading already set readingState.
 chrome.storage.session.get("readingState", (data) => {
@@ -37,6 +52,11 @@ chrome.storage.session.get("readingState", (data) => {
   }
   readingState = data.readingState;
   currentTabId = readingState.tabId;
+  // Restore paused flag from persisted state. Without this, paused stays at
+  // its module-load default (false) after a SW restart, so doResume() bails
+  // out on its guard and playback never resumes — while the popup still
+  // reports "reading".
+  paused = !!readingState.paused;
   activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
 });
 
@@ -152,6 +172,7 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (!tab || !tab.id) return;
   if (info.menuItemId === "read-selection" && info.selectionText) {
     startReading(tab.id, info.selectionText);
   } else if (info.menuItemId === "read-page") {
@@ -175,15 +196,15 @@ chrome.commands.onCommand.addListener((command) => {
   chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
     if (!tab) return;
     if (command === "read-aloud") {
-      if (activeSynthesis && !paused) {
-        // Already reading → pause
-        doPause();
-      } else if (activeSynthesis && paused) {
-        // Paused → resume
-        doResume();
-      } else {
-        // Not reading → start
-        (async () => {
+      (async () => {
+        // Recover state if service worker was killed while paused
+        if (!activeSynthesis) await recoverReadingState();
+        if (activeSynthesis && !paused) {
+          doPause();
+        } else if (activeSynthesis && paused) {
+          doResume();
+        } else {
+          // Not reading → start
           try {
             const sel = await sendToTab(tab.id, { action: "getSelectedText" });
             if (sel && sel.text) {
@@ -191,15 +212,14 @@ chrome.commands.onCommand.addListener((command) => {
               return;
             }
           } catch (_) {}
-          // No selection or failed → read entire page
           try {
             const page = await sendToTab(tab.id, { action: "getPageText" });
             if (page && page.text) {
               startReading(tab.id, page.text);
             }
           } catch (_) {}
-        })();
-      }
+        }
+      })();
     } else if (command === "stop-reading") {
       stopReading(tab.id);
     }
@@ -220,6 +240,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (currentTabId) sendToTab(currentTabId, msg).catch(() => {});
       return false;
 
+    // Offscreen keepalive — receiving this keeps service worker alive
+    case "keepalive":
+      return false;
+
     case "readPage":
     case "readSelection":
     case "stop":
@@ -229,10 +253,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!tab) return sendResponse({ error: "No active tab" });
         if (msg.action === "stop") { stopReading(tab.id); return sendResponse({ ok: true }); }
         if (msg.action === "pause") { doPause(); return sendResponse({ ok: true }); }
-        if (msg.action === "resume") { doResume(); return sendResponse({ ok: true }); }
+        if (msg.action === "resume") {
+          doResume().then(() => sendResponse({ ok: true }))
+                    .catch((e) => sendResponse({ error: e.message }));
+          return;
+        }
         const act = msg.action === "readPage" ? "getPageText" : "getSelectedText";
         sendToTab(tab.id, { action: act })
           .then((r) => {
+            console.log("[ReadAloud] readPage: getPageText returned textLen=" + (r?.text?.length || 0));
             if (r?.text) { startReading(tab.id, r.text); sendResponse({ ok: true }); }
             else sendResponse({ error: "No text found" });
           })
@@ -295,12 +324,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "getNativeStatus":
-      checkNative().then((ok) => sendResponse({ available: ok, active: !!(activeSynthesis || readingState), paused })).catch(() => sendResponse({ available: false, active: false, paused: false }));
+      (async () => {
+        if (!activeSynthesis) await recoverReadingState();
+        const ok = await checkNative().catch(() => false);
+        sendResponse({ available: ok, active: !!(activeSynthesis || readingState), paused });
+      })();
       return true;
 
     case "getStatus":
-      sendResponse({ active: !!(activeSynthesis || readingState), paused });
-      break;
+      (async () => {
+        if (!activeSynthesis) await recoverReadingState();
+        sendResponse({ active: !!(activeSynthesis || readingState), paused });
+      })();
+      return true;
 
     case "getActualVoice":
       sendResponse({ voice: (readingState?.voice) || settings.voice });
@@ -336,16 +372,54 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // ---- Pause / Resume ----
 
+// Recover in-memory state after service worker restart.
+// Returns true if a paused reading session was recovered.
+async function recoverReadingState() {
+  if (!readingState) {
+    const data = await chrome.storage.session.get("readingState");
+    readingState = data.readingState || null;
+  }
+  if (!readingState || readingState.cancelled) return false;
+  currentTabId = readingState.tabId;
+  activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
+  paused = !!readingState.paused;
+  // Reload rate — voice is stored in readingState
+  const stored = await chrome.storage.local.get(["rate"]);
+  if (stored.rate !== undefined) settings.rate = stored.rate;
+  return true;
+}
+
 function doPause() {
   if (!activeSynthesis || paused) return;
   paused = true;
+  if (readingState) {
+    readingState.paused = true;
+    chrome.storage.session.set({ readingState });
+  }
   sendOffscreen({ action: "pauseAudio" });
 }
 
-function doResume() {
-  if (!activeSynthesis || !paused) return;
+async function doResume() {
+  // Recover state if service worker was killed while paused
+  if (!activeSynthesis || !readingState) {
+    const recovered = await recoverReadingState();
+    if (!recovered || !paused) return;
+  }
+  // Sync paused from the persisted source of truth. The top-level restart
+  // recovery sets a dummy activeSynthesis but previously left paused at its
+  // default (false); guard against that stale state here.
+  if (readingState) paused = !!readingState.paused;
+  if (!paused) return;
   paused = false;
-  sendOffscreen({ action: "resumeAudio" });
+  if (readingState) {
+    readingState.paused = false;
+    chrome.storage.session.set({ readingState });
+  }
+  // Always recreate offscreen + re-synthesize current chunk.
+  // The offscreen may have been killed along with the service worker,
+  // and we can't reliably detect whether its audio is still alive.
+  await ensureOffscreen();
+  await synthesizeAndPlayChunk();
 }
 
 // ---- Core: Event-Driven Reading Loop ----
@@ -421,6 +495,14 @@ async function startReading(tabId, text) {
   // to stay under Chrome's 1MB native messaging response limit
   const maxLen = cjk ? 300 : 1000;
   const chunks = splitText(cleanedText, maxLen);
+  console.log("[ReadAloud] startReading: textLen=" + cleanedText.length +
+    " cjk=" + cjk + " chunks=" + chunks.length + " isWeRead=" + isWeRead +
+    " useNative=" + useNative);
+  if (chunks.length === 0) {
+    console.log("[ReadAloud] startReading: NO CHUNKS, finishReading");
+    await finishReading();
+    return;
+  }
 
   // Make first chunk short so audio starts playing faster.
   // This splits the first chunk at the nearest sentence boundary.
@@ -435,7 +517,7 @@ async function startReading(tabId, text) {
       cut = m.index + 1;
     }
     const remainder = first.substring(cut).trim();
-    if (cut > 0 && remainder) {
+    if (cut > 0 && remainder && first.substring(0, cut).trim()) {
       chunks[0] = first.substring(0, cut).trim();
       chunks.splice(1, 0, remainder);
     }
@@ -443,7 +525,7 @@ async function startReading(tabId, text) {
 
   const voice = pickVoice(cleanedText, settings.voice);
 
-  readingState = { tabId, chunks, currentIndex: 0, cancelled: false, useNative, voice };
+  readingState = { tabId, chunks, currentIndex: 0, cancelled: false, useNative, voice, isWeRead };
   activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
 
   await chrome.storage.session.set({ readingState });
@@ -452,8 +534,10 @@ async function startReading(tabId, text) {
   await ensureOffscreen();
 
   if (useNative) {
+    console.log("[ReadAloud] startReading: calling synthesizeAndPlayChunk, currentIndex=" + readingState.currentIndex);
     await synthesizeAndPlayChunk();
   } else {
+    console.log("[ReadAloud] startReading: native not available, finishReading");
     await finishReading();
   }
 }
@@ -462,49 +546,65 @@ async function startReading(tabId, text) {
 // Returns immediately — audioEnded event drives the next chunk.
 // Uses pre-generated cache when available to eliminate inter-chunk gaps.
 async function synthesizeAndPlayChunk() {
-  if (!readingState || readingState.cancelled) { await finishReading(); return; }
+  if (!readingState || readingState.cancelled) {
+    console.log("[ReadAloud] synthesize: no readingState/cancelled, finishReading");
+    await finishReading(); return;
+  }
 
-  const { tabId, chunks, currentIndex, voice } = readingState;
-  if (currentIndex >= chunks.length) { await finishReading(); return; }
+  const { tabId, currentIndex, voice } = readingState;
+  console.log("[ReadAloud] synthesize: currentIndex=" + currentIndex + "/" + readingState.chunks.length);
+  if (currentIndex >= readingState.chunks.length) {
+    console.log("[ReadAloud] synthesize: reached end of chunks, finishReading");
+    await finishReading(); return;
+  }
 
   const rate = rateToStr(settings.rate);
 
   try {
     let resp;
-    // Use pre-generated cache if it matches the current chunk
     if (nextChunkCache && nextChunkCache.index === currentIndex &&
         nextChunkCache.voice === voice && nextChunkCache.rate === rate) {
+      console.log("[ReadAloud] synthesize: using cache for chunk " + currentIndex);
       resp = nextChunkCache;
       nextChunkCache = null;
     } else {
-      nextChunkCache = null; // invalidate stale cache
+      nextChunkCache = null;
+      console.log("[ReadAloud] synthesize: sending to native, chunk " + currentIndex + " len=" + readingState.chunks[currentIndex].length);
       resp = await sendNative({
         action: "synthesize",
-        text: chunks[currentIndex],
+        text: readingState.chunks[currentIndex],
         voice: voice,
         rate: rate,
       });
+      console.log("[ReadAloud] synthesize: native returned, audioLen=" + (resp.audio?.length || 0) + " boundaries=" + (resp.boundaries?.length || 0));
     }
 
-    if (!readingState || readingState.cancelled) { await finishReading(); return; }
+    if (!readingState || readingState.cancelled) {
+      console.log("[ReadAloud] synthesize: readingState gone after native, finishReading");
+      await finishReading(); return;
+    }
+    if (resp.audio === undefined || resp.audio === null) {
+      console.log("[ReadAloud] synthesize: no audio in response, treating as error");
+      throw new Error("No audio in response");
+    }
 
+    console.log("[ReadAloud] synthesize: sending highlight + playAudio for chunk " + currentIndex);
     await sendToTab(tabId, {
       action: "highlight",
-      text: chunks[currentIndex],
+      text: readingState.chunks[currentIndex],
       boundaries: resp.boundaries || [],
     });
 
     await sendOffscreen({ action: "playAudio", audioBase64: resp.audio, boundaries: resp.boundaries || [] });
 
-    // Pre-generate next chunk while current audio plays
     consecutiveErrors = 0;
     pregenerateNextChunk(currentIndex + 1, voice, rate);
 
   } catch (err) {
     consecutiveErrors++;
-    console.warn("[ReadAloud] Chunk", currentIndex + 1, "failed (" + consecutiveErrors + " consecutive):", err.message);
+    console.warn("[ReadAloud] synthesize: chunk " + currentIndex + " failed (" + consecutiveErrors + " consecutive):", err.message);
     if (consecutiveErrors >= 3) {
-      console.error("[ReadAloud] Too many consecutive errors, stopping.");
+      console.error("[ReadAloud] synthesize: too many consecutive errors, finishReading");
       await finishReading();
       return;
     }
@@ -551,33 +651,43 @@ function pregenerateNextChunk(nextIndex, voice, rate) {
 let audioEndedBusy = false;
 
 async function handleAudioEnded() {
-  if (audioEndedBusy) return;
+  console.log("[ReadAloud] handleAudioEnded: called, busy=" + audioEndedBusy);
+  if (audioEndedBusy) {
+    console.log("[ReadAloud] handleAudioEnded: already busy, ignoring");
+    return;
+  }
   audioEndedBusy = true;
   try {
-    // If service worker was restarted, recover state from session storage
-    if (!readingState) {
-      const data = await chrome.storage.session.get("readingState");
-      readingState = data.readingState || null;
-      if (readingState) {
-        currentTabId = readingState.tabId;
-        activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
-        // Reload rate only — voice is stored in readingState
-        const stored = await chrome.storage.local.get(["rate"]);
-        if (stored.rate !== undefined) settings.rate = stored.rate;
-      }
+    if (!activeSynthesis) {
+      console.log("[ReadAloud] handleAudioEnded: no activeSynthesis, recovering");
+      await recoverReadingState();
     }
 
-    if (!readingState || readingState.cancelled) { await finishReading(); return; }
+    if (!readingState || readingState.cancelled) {
+      console.log("[ReadAloud] handleAudioEnded: no readingState/cancelled, finishReading");
+      await finishReading(); return;
+    }
+
+    // User paused: ignore this (possibly late-arriving) ended event so the
+    // pause isn't lost. Playback resumes from doResume() when the user unpauses.
+    if (paused) {
+      console.log("[ReadAloud] handleAudioEnded: paused, ignoring");
+      return;
+    }
 
     readingState.currentIndex++;
+    console.log("[ReadAloud] handleAudioEnded: advancing to chunk " + readingState.currentIndex);
     await chrome.storage.session.set({ readingState });
     await synthesizeAndPlayChunk();
+  } catch (e) {
+    console.error("[ReadAloud] handleAudioEnded: error:", e.message);
   } finally {
     audioEndedBusy = false;
   }
 }
 
 async function finishReading() {
+  console.log("[ReadAloud] finishReading: called, tabId=" + (readingState?.tabId || currentTabId));
   const tabId = readingState?.tabId || currentTabId;
   readingState = null;
   nextChunkCache = null;
@@ -589,6 +699,7 @@ async function finishReading() {
 }
 
 async function stopReading(tabId) {
+  console.log("[ReadAloud] stopReading: called, tabId=" + tabId + " oldTabId=" + currentTabId);
   // Clear highlights on the OLD tab (currentTabId), not the new one
   const oldTabId = currentTabId;
   if (readingState) readingState.cancelled = true;
