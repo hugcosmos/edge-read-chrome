@@ -498,8 +498,7 @@
         if (probePos !== -1) {
           startNodeIdx = ni;
           startCharIdx = probePos;
-          foundStart = true;
-          break;
+          break;   // foundStart only needed for the sliding-window branch below
         }
         // Try sliding window across concatenated nodes for chunks that
         // span multiple text nodes.
