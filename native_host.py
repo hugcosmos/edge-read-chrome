@@ -27,14 +27,33 @@ except ImportError:
 
 def read_message():
     """Read a message from Chrome (4-byte length prefix + JSON)."""
-    raw = sys.stdin.buffer.read(4)
-    if not raw or len(raw) < 4:
+    raw = _read_exact(4)
+    if not raw:
         return None
     length = struct.unpack("=I", raw)[0]
-    if length == 0:
+    # Guard against a corrupted/garbage length that would request a multi-GB
+    # read (OOM). Chrome's own messages are well under 64 MB.
+    if length == 0 or length > 64 * 1024 * 1024:
         return None
-    data = sys.stdin.buffer.read(length)
+    data = _read_exact(length)
+    if not data:
+        return None
     return json.loads(data.decode("utf-8"))
+
+def _read_exact(n):
+    """Read exactly n bytes from stdin, looping on short reads.
+
+    sys.stdin.buffer.read(n) may return fewer than n bytes if the pipe is
+    closed/interrupted mid-message; without looping, a truncated buffer
+    reaches json.loads and throws. Returns None on EOF.
+    """
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sys.stdin.buffer.read(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
 
 def send_message(obj):
     """Send a message to Chrome (4-byte length prefix + JSON)."""
@@ -130,11 +149,14 @@ async def main_loop():
     current_task = None
 
     while True:
-        # Read stdin in a thread pool so the event loop stays responsive
+        # Read stdin in a thread pool so the event loop stays responsive.
+        # Timeout is a safety net only: the background service worker sends a
+        # ping every ~2 minutes while a reading session is active (see the
+        # "native-keepalive" alarm in background.js), which keeps stdin fed.
         try:
             msg = await asyncio.wait_for(
                 loop.run_in_executor(None, read_message),
-                timeout=300,
+                timeout=3600,
             )
         except asyncio.TimeoutError:
             # Must force-exit: the stdin-reading thread is still blocking
@@ -145,8 +167,15 @@ async def main_loop():
         if msg is None:
             break
 
-        # Cancel in-flight synthesis — new message takes priority
-        if current_task is not None and not current_task.done():
+        # Only a new synthesis request is allowed to preempt an in-flight one.
+        # Lightweight messages (ping/getVoices) must NOT cancel synthesis:
+        # background.js uses one-shot sendNativeMessage, and a cancelled
+        # synthesis emits {"error":"cancelled"} which Chrome routes (FIFO) to
+        # the earliest pending callback — often the main playback request,
+        # making it appear to fail and aborting playback. ping/getVoices are
+        # cheap and run alongside the synthesis task.
+        action = msg.get("action", "")
+        if action == "synthesize" and current_task is not None and not current_task.done():
             current_task.cancel()
 
         current_task = asyncio.create_task(_handle_and_respond(msg))

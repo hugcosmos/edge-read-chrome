@@ -81,6 +81,11 @@ function sendNative(msg, retries = 2) {
       console.error("[ReadAloud] sendNative exception:", e);
       reject(e);
     }
+  }).then((resp) => {
+    // Successful round-trip → host is reachable. This also recovers
+    // checkNative's permanently-cached false if the host came up later.
+    nativeAvailable = true;
+    return resp;
   }).catch((err) => {
     nativeAvailable = null;
     if (retries > 0) {
@@ -115,6 +120,10 @@ function rateToStr(m) {
 // ---- Offscreen Audio ----
 
 async function ensureOffscreen() {
+  // Avoid a redundant createDocument() (which rejects "Only a single object...")
+  // by checking for an existing document first.
+  const existing = await chrome.offscreen.hasDocument().catch(() => false);
+  if (existing) return;
   try {
     await chrome.offscreen.createDocument({
       url: "offscreen.html",
@@ -122,6 +131,12 @@ async function ensureOffscreen() {
       justification: "Playing TTS audio",
     });
   } catch (_) {}
+}
+
+async function closeOffscreen() {
+  // Release the offscreen document when idle so its keepalive interval stops
+  // pinning the service worker (and via it, the native host) awake forever.
+  await chrome.offscreen.closeDocument().catch(() => {});
 }
 
 function sendOffscreen(msg) {
@@ -602,7 +617,13 @@ async function synthesizeAndPlayChunk() {
       boundaries: resp.boundaries || [],
     });
 
-    await sendOffscreen({ action: "playAudio", audioBase64: resp.audio, boundaries: resp.boundaries || [] });
+    // Check playAudio's response: if offscreen is dead or play() rejected,
+    // audioEnded will never arrive and playback would hang silently. Throw so
+    // the catch below retries via consecutiveErrors instead of stalling.
+    const playResp = await sendOffscreen({ action: "playAudio", audioBase64: resp.audio, boundaries: resp.boundaries || [] });
+    if (playResp.error) {
+      throw new Error("playAudio: " + playResp.error);
+    }
 
     consecutiveErrors = 0;
     pregenerateNextChunk(currentIndex + 1, voice, rate);
@@ -702,6 +723,7 @@ async function finishReading() {
   currentTabId = null;
   paused = false;
   await chrome.storage.session.remove("readingState").catch(() => {});
+  await closeOffscreen();
   if (tabId) await sendToTab(tabId, { action: "done" }).catch(() => {});
 }
 
@@ -718,6 +740,7 @@ async function stopReading(tabId) {
   audioEndedBusy = false;
   await chrome.storage.session.remove("readingState").catch(() => {});
   sendOffscreen({ action: "stopAudio" });
+  await closeOffscreen();
   if (oldTabId) sendToTab(oldTabId, { action: "stop" }).catch(() => {});
 }
 
