@@ -582,8 +582,27 @@ async function synthesizeAndPlayChunk() {
   const { tabId, currentIndex, voice } = readingState;
   console.log("[ReadAloud] synthesize: currentIndex=" + currentIndex + "/" + readingState.chunks.length);
   if (currentIndex >= readingState.chunks.length) {
-    console.log("[ReadAloud] synthesize: reached end of chunks, finishReading");
-    await finishReading(); return;
+    // WeRead renders one screen at a time; "end of chunks" may just mean the
+    // current screen is done. Try turning the page and extracting more text.
+    if (readingState.isWeRead) {
+      console.log("[ReadAloud] synthesize: end of WeRead screen, turning page");
+      const r = await sendToTab(tabId, { action: "turnAndExtract" });
+      const moreText = r?.text || "";
+      if (moreText) {
+        const cjk = isCJK(moreText);
+        const more = splitText(moreText, cjk ? 300 : 1000);
+        readingState.chunks = readingState.chunks.concat(more);
+        await chrome.storage.session.set({ readingState });
+        console.log("[ReadAloud] synthesize: turned page, +" + more.length + " chunks, continuing");
+        // currentIndex now points at the first new chunk; fall through to synthesize it.
+      } else {
+        console.log("[ReadAloud] synthesize: no more pages, finishReading");
+        await finishReading(); return;
+      }
+    } else {
+      console.log("[ReadAloud] synthesize: reached end of chunks, finishReading");
+      await finishReading(); return;
+    }
   }
 
   const rate = rateToStr(settings.rate);

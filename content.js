@@ -61,6 +61,9 @@
           case "getPageText":
             extractWereadText().then(text => sendResponse({ text }));
             return true;
+          case "turnAndExtract":
+            turnAndExtract().then(text => sendResponse({ text }));
+            return true;
           case "getSelectedText":
             sendResponse({ text: window.getSelection().toString().trim() });
             return false;
@@ -237,6 +240,38 @@
     })();
     console.log("[ReadAloud] weread: extracted " + bestLen + " chars");
     return bestChars.map(c => c.text).join("");
+  }
+
+  // Turn to the next page and extract the new text. Used by background when
+  // the current screen's chunks are exhausted but the chapter continues.
+  // Returns "" if there's no further page (end of chapter).
+  async function turnAndExtract() {
+    const beforeLen = wereadChars ? wereadChars.length : 0;
+    // Page-turn: dispatch ArrowRight to the reader containers WeRead listens on.
+    const targets = [
+      document,
+      document.body,
+      document.querySelector(".app_content, .readerChapterContent, .wr_canvasContainer"),
+    ].filter(Boolean);
+    for (const t of targets) {
+      for (const typ of ["keydown", "keyup"]) {
+        t.dispatchEvent(new KeyboardEvent(typ, {
+          key: "ArrowRight", code: "ArrowRight", keyCode: 39, which: 39,
+          bubbles: true, cancelable: true,
+        }));
+      }
+    }
+    // Wait for the capture buffer to grow (new page rendered). Poll up to ~6s.
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 6000) {
+      await new Promise(r => setTimeout(r, 600));
+      // Re-invoke extraction; if it yields more chars than before, a new page loaded.
+      const text = await extractWereadText();
+      if (text.length > beforeLen) {
+        return text;
+      }
+    }
+    return "";  // no new page → end of chapter
   }
 
 
