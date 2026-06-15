@@ -15,6 +15,7 @@
   let highlightedEls = [];
   let lastHighlightIdx = -1; // track which word is highlighted to detect changes
   let boundaryToSpan = {};   // boundary index → span index
+  let originalTexts = [];    // { span, text } per wrapped span — used to restore DOM on clear
 
   // ---- WeRead canvas-based highlighting state ----
   let wereadChars = null;        // [{text, x, y, ci}, ...] one per char, matches extracted text
@@ -139,7 +140,8 @@
           break;
 
         case "highlightWord":
-          applyHighlight(boundaryToSpan[msg.index]);
+          // msg.index < 0 signals a gap (clear highlight); pass it through.
+          applyHighlight(msg.index < 0 ? msg.index : boundaryToSpan[msg.index]);
           break;
 
         case "error":
@@ -572,6 +574,7 @@
     }
 
     // Modify DOM: for each text node that has words, create a fragment
+    originalTexts = [];
     for (const niStr of Object.keys(nodeWords)) {
       const ni = parseInt(niStr, 10);
       const node = textNodes[ni];
@@ -592,6 +595,7 @@
         span.textContent = fullText.substring(w.origStart, w.origEnd);
         span.dataset.offset = w.boundary.offset;
         span.dataset.duration = w.boundary.duration;
+        originalTexts.push({ span, text: fullText.substring(w.origStart, w.origEnd) });
         fragment.appendChild(span);
         boundaryToSpan[w.boundary.index] = allSpans.length;
         allSpans.push(span);
@@ -617,6 +621,12 @@
   // ---- Highlight Application (driven by offscreen via audio.currentTime) ----
 
   function applyHighlight(idx) {
+    // idx < 0 means a gap between word boundaries (sent by offscreen): clear
+    // the active highlight instead of leaving the previous word stuck.
+    if (idx < 0) {
+      for (const el of highlightedEls) el.classList.remove("readaloud-active-word");
+      return;
+    }
     for (let i = 0; i < highlightedEls.length; i++) {
       highlightedEls[i].classList.toggle("readaloud-active-word", i === idx);
     }
@@ -759,14 +769,21 @@
 
   function clearHighlight() {
     lastHighlightIdx = -1;
-    const parents = new Set();
+    // Restore the original text nodes by replacing each wrapped span back
+    // with a plain Text node of its original text. This reverses the DOM
+    // mutation exactly, instead of leaving orphaned <span> elements behind
+    // (the old approach only stripped classes and called parent.normalize(),
+    // which merges adjacent Text nodes but never removes the span tags).
+    for (const { span, text } of originalTexts) {
+      if (span.parentNode) span.parentNode.replaceChild(document.createTextNode(text), span);
+    }
+    originalTexts = [];
+    // Still clear any paragraph-level active marks from the highlightParagraph fallback.
     for (const el of highlightedEls) {
       el.classList.remove("readaloud-active-word");
       el.classList.remove("readaloud-word");
       el.classList.remove("readaloud-active");
-      if (el.parentElement) parents.add(el.parentElement);
     }
-    for (const p of parents) p.normalize();
     highlightedEls = [];
   }
 })();

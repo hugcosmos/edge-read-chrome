@@ -23,12 +23,17 @@ if python3 -c "import edge_tts" 2>/dev/null; then
   echo "  OK (python: $PYTHON_PATH)"
 else
   echo "  Installing..."
-  pip3 install edge-tts
+  # Use "python3 -m pip" (not bare pip3) so edge-tts is installed into the
+  # same interpreter the native_host.py shebang will point at. With bare pip3
+  # the package could land in a different environment (e.g. system pip vs
+  # conda python), leaving the host unable to import edge_tts.
+  python3 -m pip install edge-tts
   echo "  Done"
 fi
 
 # Fix shebang to use the correct python3
 sed -i '' "1s|.*|#!$PYTHON_PATH|" "$SCRIPT_DIR/native_host.py"
+chmod +x "$SCRIPT_DIR/native_host.py"
 echo "  Shebang set to: $PYTHON_PATH"
 
 # ---- 2. Find extension ID (auto) ----

@@ -7,14 +7,17 @@ let boundaries = [];
 let highlightTimer = null;
 let lastIdx = -1;
 
+// Keep service worker alive while offscreen exists (MV3 kills idle workers after ~30s)
+setInterval(() => {
+  try { chrome.runtime.sendMessage({ action: "keepalive" }).catch(() => {}); } catch (_) {}
+}, 25000);
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === "playAudio") {
     stopHighlightTimer();
     boundaries = msg.boundaries || [];
 
-    const bin = atob(msg.audioBase64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const bytes = Uint8Array.from(atob(msg.audioBase64), c => c.charCodeAt(0));
     const blob = new Blob([bytes.buffer], { type: "audio/mpeg" });
 
     if (currentAudio) {
@@ -27,21 +30,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     currentAudio.volume = 1.0;
 
     currentAudio.onended = () => {
+      console.log("[ReadAloud] offscreen: audio onended, sending audioEnded");
       stopHighlightTimer();
       cleanup();
       chrome.runtime.sendMessage({ action: "audioEnded" });
     };
 
     currentAudio.onerror = () => {
+      console.log("[ReadAloud] offscreen: audio onerror, sending audioEnded");
       stopHighlightTimer();
       cleanup();
       chrome.runtime.sendMessage({ action: "audioEnded" });
     };
 
     currentAudio.play().then(() => {
+      console.log("[ReadAloud] offscreen: play() resolved ok, audio duration=" + currentAudio.duration);
       sendResponse({ ok: true });
       startHighlightTimer();
     }).catch((e) => {
+      console.log("[ReadAloud] offscreen: play() rejected: " + e.message);
       cleanup();
       sendResponse({ error: e.message });
     });
@@ -96,8 +103,11 @@ function startHighlightTimer() {
       }
     }
 
-    if (currentIdx !== lastIdx && currentIdx >= 0) {
+    if (currentIdx !== lastIdx) {
       lastIdx = currentIdx;
+      // Send even when currentIdx === -1 (gap between word boundaries): the
+      // content script clears the active highlight, so it doesn't stay stuck
+      // on the previous word during the silent gap.
       chrome.runtime.sendMessage({
         action: "highlightWord",
         index: currentIdx,

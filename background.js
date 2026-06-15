@@ -22,7 +22,10 @@ let nextChunkCache = null; // { index, audio, boundaries, voice, rate }
 let pregenId = 0; // bumped to invalidate in-flight pre-generations
 let consecutiveErrors = 0;
 
-chrome.storage.local.get(["voice", "rate"], (stored) => {
+// settingsReady resolves once stored settings are loaded. Without this guard,
+// an early message (e.g. getSettings arriving right after a service-worker
+// restart) could read the module-load defaults instead of the stored voice/rate.
+const settingsReady = chrome.storage.local.get(["voice", "rate"]).then((stored) => {
   if (stored.voice) settings.voice = stored.voice;
   if (stored.rate !== undefined) settings.rate = stored.rate;
 });
@@ -293,17 +296,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "getSettings":
-      sendResponse(settings);
-      break;
+      settingsReady.then(() => sendResponse(settings));
+      return true;
 
     case "updateSettings":
       settings = { ...settings, ...msg.settings };
       chrome.storage.local.set(settings);
       // If reading, apply voice/rate change to next chunk immediately
       if (readingState && (msg.settings.voice || msg.settings.rate !== undefined)) {
+        // Honor the user's explicit voice choice — do NOT re-run pickVoice
+        // here. pickVoice already auto-matched language once at startReading;
+        // overriding now would silently revert a manual switch (e.g. user
+        // picks an English voice while reading Chinese text).
         if (msg.settings.voice) {
-          const newVoice = pickVoice(readingState.chunks[0], msg.settings.voice);
-          readingState.voice = newVoice;
+          readingState.voice = msg.settings.voice;
         }
         nextChunkCache = null;
         pregenId++; // invalidate any in-flight pre-generation
@@ -361,8 +367,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case "getActualVoice":
-      sendResponse({ voice: (readingState?.voice) || settings.voice });
-      break;
+      settingsReady.then(() => sendResponse({ voice: (readingState?.voice) || settings.voice }));
+      return true;
 
     case "getReadingLanguage":
       if (!readingState || !readingState.chunks.length) {
