@@ -194,8 +194,14 @@ async def main_loop():
 def main():
     try:
         asyncio.run(main_loop())
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - log then exit so startup
+        # failures (missing edge-tts, bad python, etc.) are diagnosable in
+        # chrome://nativeMessaging's captured stderr instead of vanishing.
+        try:
+            sys.stderr.write("[readaloud] native host crashed: %r\n" % (exc,))
+            sys.stderr.flush()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()

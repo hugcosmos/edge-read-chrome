@@ -22,26 +22,10 @@
   let wereadBoundaries = null;   // TTS word boundaries for current chunk
   let wereadChunkOffset = -1;    // char index in wereadChars where current chunk starts
   let wereadWordRanges = null;   // [{startCharIdx, endCharIdx}, ...] precomputed per boundary
-  let wereadCanvasDims = null;   // { w, h } of canvas at capture time — used to detect re-render
   let wereadOverlay = null;      // highlight overlay element
   let wereadCursorOffset = 0;    // forward-only cursor: end char offset of last matched chunk
 
-  // ---- WeRead: detect chapter switch (posted from hook in MAIN world) ----
-  // When the hook detects canvas-set replacement, it clears its capture buffer
-  // and posts this event. We stop any active reading so the user must re-click
-  // ---- WeRead: no chapter-switch polling here ----
-  // The hook filters chars by canvas-presence-in-DOM (data-ra-cid), which
-  // correctly handles real chapter switches (entire canvas set replaced)
-  // without false positives from in-chapter section-title changes. We do NOT
-  // poll the title element: .readerTopBar_title_chapter updates on every
-  // section within a chapter, so polling it would interrupt reading mid-
-  // chapter when the reader reaches a new section heading.
-
-
   // ---- SPA route change detection ----
-  // history.pushState/replaceState (used by WeRead chapter nav, Zhihu, etc.)
-  // does NOT trigger chrome.tabs.onUpdated with changeInfo.url, so background
-  // can't auto-stop on its own. Poll location.href and notify it instead.
   let lastUrl = location.href;
   setInterval(() => {
     if (location.href !== lastUrl) {
@@ -61,9 +45,6 @@
           case "getPageText":
             extractWereadText().then(text => sendResponse({ text }));
             return true;
-          case "turnAndExtract":
-            turnAndExtract().then(text => sendResponse({ text }));
-            return true;
           case "getSelectedText":
             sendResponse({ text: window.getSelection().toString().trim() });
             return false;
@@ -73,17 +54,26 @@
             wereadBoundaries = null;
             wereadChunkOffset = -1;
             wereadCursorOffset = 0;
+            // DOM text: highlight the whole chapter content area.
+            if (!wereadChars) {
+              const el = document.querySelector(".readerChapterContent");
+              if (el) el.classList.add("readaloud-active");
+            }
             break;
           case "stop":
           case "done":
             clearHighlight();
             removeWereadOverlay();
+            if (!wereadChars) {
+              const el = document.querySelector(".readerChapterContent");
+              if (el) el.classList.remove("readaloud-active");
+            }
             break;
           case "highlight":
-            handleWereadHighlight(msg);
+            if (wereadChars) handleWereadHighlight(msg);
             break;
           case "highlightWord":
-            highlightWereadWord(msg.index);
+            if (wereadChars) highlightWereadWord(msg.index);
             break;
           case "error":
             console.error("[ReadAloud]", msg.error);
@@ -203,76 +193,223 @@
   // before a previous extraction finished): a newer call bumps extractSeq, so
   // stale in-flight extractions bail out instead of overwriting wereadChars.
   let extractSeq = 0;
+
+  // ---- WeRead: slice to one section ----
+  // Detects section breaks by three signals: larger font than body, no
+  // Chinese punctuation in the line, and a fill color that differs from
+  // the body text. More robust than max(fs) alone.
+  function sliceToSection(chars) {
+    if (chars.length < 4) return chars;
+
+    // Group chars into lines: same cid, similar Y (±5px).
+    const lines = [];
+    let cur = null;
+    for (const c of chars) {
+      const cid = c.cid >>> 0;
+      if (!cur || cid !== cur.cid || Math.abs(c.y - cur.lastY) > 5) {
+        cur = { cid, lastY: c.y, chars: [], fsSum: 0, colors: {} };
+        lines.push(cur);
+      }
+      cur.chars.push(c);
+      cur.fsSum += c.fs;
+      cur.lastY = c.y;
+      const col = c.col || "";
+      cur.colors[col] = (cur.colors[col] || 0) + 1;
+    }
+
+    // Title lines may include ？！""'' but not sentence/flow punctuation.
+    const bodyPunct = /[。，、：；…—]/;
+    for (const ln of lines) {
+      ln.text = ln.chars.map(c => c.text).join("");
+      ln.avgFs = ln.fsSum / ln.chars.length;
+      ln.hasPunct = bodyPunct.test(ln.text);
+      // Dominant color for this line
+      let topCol = "", topN = 0;
+      for (const col in ln.colors) {
+        if (ln.colors[col] > topN) { topN = ln.colors[col]; topCol = col; }
+      }
+      ln.col = topCol;
+    }
+
+    // Body = most common font size and color across lines.
+    const fsCounts = {}, colCounts = {};
+    for (const ln of lines) {
+      const k = Math.round(ln.avgFs);
+      fsCounts[k] = (fsCounts[k] || 0) + 1;
+      colCounts[ln.col] = (colCounts[ln.col] || 0) + 1;
+    }
+    let bodyFs = 0, bodyCol = "";
+    let maxFSC = 0, maxColC = 0;
+    for (const k in fsCounts) {
+      if (fsCounts[k] > maxFSC) { maxFSC = fsCounts[k]; bodyFs = parseInt(k); }
+    }
+    for (const k in colCounts) {
+      if (colCounts[k] > maxColC) { maxColC = colCounts[k]; bodyCol = k; }
+    }
+
+    // Title: font larger than body AND color differs from body.
+    const isTitle = (ln) =>
+      Math.round(ln.avgFs) > bodyFs && ln.col !== bodyCol;
+
+    // Find the first visible character (screen Y ≥ 0).
+    const cv = {};
+    for (const c of chars) {
+      const k = String(c.cid >>> 0);
+      if (cv[k]) continue;
+      const cnv = document.querySelector('canvas[data-ra-cid="' + k + '"]');
+      if (!cnv) { cv[k] = null; continue; }
+      cv[k] = {
+        top: cnv.getBoundingClientRect().top,
+        sy: cnv.offsetHeight > 0 ? cnv.height / cnv.offsetHeight : 1,
+      };
+    }
+    // Diagnostic: print canvas rects and a few sample screen-Y values.
+    console.log("[ReadAloud] weread cv cids:", Object.keys(cv).join(","),
+      "scrollY=" + window.scrollY);
+    for (const k in cv) {
+      if (cv[k]) console.log("  cid=" + k + " top=" + Math.round(cv[k].top) + " sy=" + cv[k].sy);
+      else console.log("  cid=" + k + " MISSING");
+    }
+    let visStart = 0;
+    for (let i = 0; i < chars.length; i++) {
+      const m = cv[String(chars[i].cid >>> 0)];
+      if (m && m.top + chars[i].y / m.sy >= 0) { visStart = i; break; }
+    }
+
+    // Find which line contains visStart.
+    let visLine = -1;
+    let pos = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (visStart < pos + lines[i].chars.length) { visLine = i; break; }
+      pos += lines[i].chars.length;
+    }
+    if (visLine < 0) visLine = lines.length - 1;
+
+    // Diagnostic: print lines around visLine.
+    const dbgStart = Math.max(0, visLine - 3);
+    const dbgEnd = Math.min(lines.length, visLine + 5);
+    console.log("[ReadAloud] weread lines around visLine=" + visLine +
+      " bodyFs=" + bodyFs + " bodyCol=" + bodyCol + ":");
+    for (let i = dbgStart; i < dbgEnd; i++) {
+      const ln = lines[i];
+      console.log("  [" + i + "]" + (isTitle(ln) ? " TITLE" : " body") +
+        " fs=" + Math.round(ln.avgFs) + " col=" + ln.col +
+        " punct=" + ln.hasPunct + " text=\"" + ln.text.substring(0, 30) + "\"");
+    }
+
+    // Search forward (≤3 lines) then backward for nearest title.
+    let startLine = -1;
+    for (let i = visLine; i < Math.min(lines.length, visLine + 4); i++) {
+      if (isTitle(lines[i])) { startLine = i; break; }
+    }
+    if (startLine < 0) {
+      for (let i = visLine; i >= 0; i--) {
+        if (isTitle(lines[i])) { startLine = i; break; }
+      }
+    }
+    if (startLine < 0) startLine = visLine;
+
+    // Walk forward to next title line.
+    let endLine = lines.length;
+    for (let i = startLine + 1; i < lines.length; i++) {
+      if (isTitle(lines[i])) { endLine = i; break; }
+    }
+
+    // Convert line indices back to char range.
+    let startIdx = 0;
+    for (let i = 0; i < startLine; i++) startIdx += lines[i].chars.length;
+    let endIdx = startIdx;
+    for (let i = startLine; i < endLine; i++) endIdx += lines[i].chars.length;
+
+    const slice = chars.slice(startIdx, endIdx);
+    console.log("[ReadAloud] weread section: bodyFs=" + bodyFs +
+      " bodyCol=" + bodyCol +
+      " visStart=" + visStart + " visLine=" + visLine +
+      " startLine=" + startLine + " endLine=" + endLine +
+      "/" + lines.length + " lines" +
+      " len=" + slice.length +
+      " preview=\"" + slice.map(c => c.text).join("").substring(0, 30) + "\"");
+    return slice;
+  }
+
+  // Fallback: extract text from WeRead's DOM text layer (.readerChapterContent
+  // absolutely-positioned spans). Used when the canvas buffer is stale.
+  function extractWereadDomText() {
+    const spans = document.querySelectorAll(".readerChapterContent span[data-wr-role=text]");
+    if (!spans.length) return "";
+    const arr = Array.from(spans).map(s => {
+      const r = s.getBoundingClientRect();
+      return { text: s.textContent, x: Math.round(r.left), y: Math.round(r.top) };
+    });
+    // Vertical text: primary sort Y (top→bottom), secondary X ascending.
+    // Right-to-left columns are correct, but since we concat row-by-row,
+    // we need left-to-right within each row so the output reads naturally.
+    arr.sort((a, b) => a.y - b.y || a.x - b.x);
+    // Start from the first visible char.
+    let visStart = 0;
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i].y >= 0) { visStart = i; break; }
+    }
+    const text = arr.map(c => c.text).join("").substring(visStart);
+    console.log("[ReadAloud] weread DOM text: " + arr.length + " spans, start=" +
+      visStart + " preview=\"" + text.substring(0, 40) + "\"");
+    return text;
+  }
+
+  // Extract text from WeRead. Canvas first (section detection + overlay);
+  // fall back to DOM text layer only when canvas has no visible chars.
+  //
+  // extractSeq guards against concurrent calls.
   async function extractWereadText() {
     const mySeq = ++extractSeq;
+
     let bestChars = [];
     let bestLen = 0;
     let stableCount = 0;
-    // Poll up to ~15s. Stop when buffer hasn't grown for 2 consecutive checks.
-    for (let i = 0; i < 12; i++) {
-      if (mySeq !== extractSeq) return "";   // superseded by a newer extraction
+    for (let i = 0; i < 10; i++) {
+      if (mySeq !== extractSeq) return "";
       const data = await fetchCapturedText();
       const chars = data.chars || [];
-      console.log("[ReadAloud] weread: poll " + i + " chars=" + chars.length +
-        " best=" + bestLen);
       if (chars.length > bestLen) {
         bestChars = chars;
         bestLen = chars.length;
         stableCount = 0;
       } else {
         stableCount++;
-        // Buffer stable for 2 checks AND we have enough text → done
         if (stableCount >= 2 && bestLen > 100) break;
       }
       await new Promise(r => setTimeout(r, 1200));
     }
-    if (mySeq !== extractSeq) return "";     // final check before writing globals
+    if (mySeq !== extractSeq) return "";
     if (bestLen <= 50) {
+      // Canvas empty → try DOM.
+      const domText = extractWereadDomText();
+      if (domText) { wereadChars = null; console.log("[ReadAloud] weread: using DOM text, " + domText.length + " chars"); return domText; }
       console.log("[ReadAloud] weread: no text after polling (" + bestLen + " chars)");
       return "";
     }
-    wereadChars = bestChars;
+    const sectionChars = sliceToSection(bestChars);
+    if (sectionChars.length === 0 || !sectionChars.some(c => {
+      const cnv = document.querySelector('canvas[data-ra-cid="' + (c.cid >>> 0) + '"]');
+      if (!cnv) return false;
+      const top = cnv.getBoundingClientRect().top;
+      const sy = cnv.offsetHeight > 0 ? cnv.height / cnv.offsetHeight : 1;
+      return top + c.y / sy >= 0;
+    })) {
+      // Sliced section has no visible chars → canvas is stale, use DOM.
+      const domText = extractWereadDomText();
+      if (domText) { wereadChars = null; console.log("[ReadAloud] weread: using DOM text, " + domText.length + " chars"); return domText; }
+      console.log("[ReadAloud] weread: section slice empty / no visible");
+      return "";
+    }
+    wereadChars = sectionChars;
     wereadChunkOffset = 0;
     wereadCursorOffset = 0;
-    wereadCanvasDims = (() => {
-      const c = document.querySelector("canvas[data-ra-cidx]");
-      return c ? { w: c.offsetWidth, h: c.offsetHeight } : null;
-    })();
-    console.log("[ReadAloud] weread: extracted " + bestLen + " chars");
-    return bestChars.map(c => c.text).join("");
+    const text = sectionChars.map(c => c.text).join("");
+    console.log("[ReadAloud] weread: extracted " + sectionChars.length + " chars");
+    return text;
   }
 
-  // Turn to the next page and extract the new text. Used by background when
-  // the current screen's chunks are exhausted but the chapter continues.
-  // Returns "" if there's no further page (end of chapter).
-  async function turnAndExtract() {
-    const beforeLen = wereadChars ? wereadChars.length : 0;
-    // Page-turn: dispatch ArrowRight to the reader containers WeRead listens on.
-    const targets = [
-      document,
-      document.body,
-      document.querySelector(".app_content, .readerChapterContent, .wr_canvasContainer"),
-    ].filter(Boolean);
-    for (const t of targets) {
-      for (const typ of ["keydown", "keyup"]) {
-        t.dispatchEvent(new KeyboardEvent(typ, {
-          key: "ArrowRight", code: "ArrowRight", keyCode: 39, which: 39,
-          bubbles: true, cancelable: true,
-        }));
-      }
-    }
-    // Wait for the capture buffer to grow (new page rendered). Poll up to ~6s.
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < 6000) {
-      await new Promise(r => setTimeout(r, 600));
-      // Re-invoke extraction; if it yields more chars than before, a new page loaded.
-      const text = await extractWereadText();
-      if (text.length > beforeLen) {
-        return text;
-      }
-    }
-    return "";  // no new page → end of chapter
-  }
 
 
 
@@ -797,7 +934,6 @@
     wereadWordRanges = null;
     wereadChunkOffset = -1;
     wereadChars = null;
-    wereadCanvasDims = null;
     wereadCursorOffset = 0;
   }
 
