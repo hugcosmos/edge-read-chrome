@@ -309,10 +309,21 @@
     }
     if (startLine < 0) startLine = visLine;
 
-    // Walk forward to next title line.
+    // Multi-line title: merge preceding consecutive title lines so the slice
+    // starts at the first line of the title, not mid-title.
+    while (startLine > 0 && isTitle(lines[startLine - 1])) startLine--;
+
+    // Walk forward to next title line. Skip consecutive title lines at the
+    // start (multi-line titles) — only a title line after body content marks
+    // the next section.
     let endLine = lines.length;
+    let sawBody = false;
     for (let i = startLine + 1; i < lines.length; i++) {
-      if (isTitle(lines[i])) { endLine = i; break; }
+      if (isTitle(lines[i])) {
+        if (sawBody) { endLine = i; break; }
+      } else {
+        sawBody = true;
+      }
     }
 
     // Convert line indices back to char range.
