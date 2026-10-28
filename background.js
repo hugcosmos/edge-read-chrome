@@ -19,6 +19,10 @@ let currentTabId = null;
 let readingState = null;
 // Shape: { tabId, chunks[], currentIndex, cancelled, useNative }
 let nextChunkCache = null; // { index, audio, boundaries, voice, rate }
+let pregenPromise = null;
+let pregenIndex = -1;
+let pregenVoice = null;
+let pregenRate = null;
 let pregenId = 0; // bumped to invalidate in-flight pre-generations
 let consecutiveErrors = 0;
 
@@ -91,6 +95,9 @@ function sendNative(msg, retries = 2) {
     return resp;
   }).catch((err) => {
     nativeAvailable = null;
+    if (err.message && err.message.includes("cancelled")) {
+      throw err;
+    }
     if (retries > 0) {
       console.warn("[ReadAloud] Native retry (" + retries + " left):", err.message);
       return new Promise((r) => setTimeout(r, 500)).then(() => sendNative(msg, retries - 1));
@@ -100,14 +107,21 @@ function sendNative(msg, retries = 2) {
 }
 
 async function checkNative() {
-  if (nativeAvailable !== null) return nativeAvailable;
+  // A confirmed-true result is cached permanently (the host doesn't go away).
+  // A confirmed-FALSE result is NOT cached: the failure is often transient —
+  // e.g. the onInstalled ping fires before install.sh has registered the host,
+  // or the host came up between the ping and now. Caching false would make
+  // startReading silently finishReading() forever, forcing an extension reload.
+  // Returning null leaves the cache "unknown" so the next caller re-probes.
+  if (nativeAvailable === true) return true;
   if (nativeCheckPromise) return nativeCheckPromise;
   nativeCheckPromise = (async () => {
     try {
       await sendNative({ action: "ping" });
       nativeAvailable = true;
     } catch {
-      nativeAvailable = false;
+      // Leave nativeAvailable at null (unknown), not false, so it re-probes.
+      nativeAvailable = null;
     }
     nativeCheckPromise = null;
     return nativeAvailable;
@@ -167,6 +181,16 @@ async function sendToTab(tabId, message) {
     });
   } catch (_) {
     try {
+      // content.js guards against double-init with window.__readaloudLoaded.
+      // If the first load failed mid-way (or a prior navigation left the flag
+      // set), re-injecting content.js would hit the guard and re-register
+      // nothing — leaving us with no listener again. Clear the flag in the
+      // isolated world (content.js's default world) first so the re-injected
+      // file actually runs its body.
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => { try { window.__readaloudLoaded = false; } catch (e) {} },
+      });
       await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
       await chrome.scripting.insertCSS({ target: { tabId }, files: ["content.css"] });
       return await new Promise((resolve, reject) => {
@@ -353,16 +377,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case "getNativeStatus":
       (async () => {
-        if (!activeSynthesis) await recoverReadingState();
+        // Read-only: peek persisted state without creating a dummy
+        // activeSynthesis (status queries must not mutate playback state).
+        const peek = activeSynthesis ? null : await peekReadingState();
         const ok = await checkNative().catch(() => false);
-        sendResponse({ available: ok, active: !!(activeSynthesis || readingState), paused });
+        const active = activeSynthesis || (peek && peek.active);
+        sendResponse({ available: ok, active: !!active, paused: peek ? peek.paused : paused });
       })();
       return true;
 
     case "getStatus":
       (async () => {
-        if (!activeSynthesis) await recoverReadingState();
-        sendResponse({ active: !!(activeSynthesis || readingState), paused });
+        const peek = activeSynthesis ? null : await peekReadingState();
+        const active = activeSynthesis || (peek && peek.active);
+        sendResponse({ active: !!active, paused: peek ? peek.paused : paused });
       })();
       return true;
 
@@ -375,23 +403,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ lang: "none" });
       } else {
         const text = readingState.chunks[readingState.currentIndex] || "";
-        sendResponse({ lang: isCJK(text) ? "cjk" : "other" });
+        sendResponse({ lang: detectLang(text) });
       }
       break;
 
     case "checkVoiceCompatible": {
       const voice = msg.voice || "";
-      const voiceLang = voice.substring(0, 5).toLowerCase();
-      const cjkLangs = ["zh-cn", "zh-tw", "zh-hk", "ja-jp", "ko-kr"];
-      const isCJKVoice = cjkLangs.includes(voiceLang);
+      const voiceFam = voice.substring(0, 2).toLowerCase();
 
       let textLang = "none";
       if (readingState && readingState.chunks.length) {
         const text = readingState.chunks[readingState.currentIndex] || "";
-        textLang = isCJK(text) ? "cjk" : "other";
+        textLang = detectLang(text);
       }
 
-      const compatible = textLang === "none" || (textLang === "cjk" && isCJKVoice) || (textLang === "other" && !isCJKVoice);
+      // Compatible when the voice's language family matches the detected
+      // text language. "other" (non-CJK) accepts any non-CJK family (en/fr/
+      // de/es/...); a CJK lang requires its own family (ja voice on ja text).
+      let compatible;
+      if (textLang === "none") {
+        compatible = true;
+      } else if (textLang === "other") {
+        const cjkFamilies = ["zh", "ja", "ko"];
+        compatible = !cjkFamilies.includes(voiceFam);
+      } else {
+        compatible = voiceFam === textLang;
+      }
       sendResponse({ compatible, textLang });
       break;
     }
@@ -399,6 +436,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // ---- Pause / Resume ----
+
+// Read-only peek at persisted reading state for status queries. Loads
+// readingState + paused from storage so the popup reflects truth, but does
+// NOT create a dummy activeSynthesis (creating one would let a later stop()
+// mark the recovered state cancelled as a side effect of a read-only query).
+async function peekReadingState() {
+  if (!readingState) {
+    const data = await chrome.storage.session.get("readingState");
+    readingState = data.readingState || null;
+  }
+  return { active: !!(readingState && !readingState.cancelled), paused: !!(readingState && readingState.paused) };
+}
 
 // Recover in-memory state after service worker restart.
 // Returns true if a paused reading session was recovered.
@@ -443,9 +492,22 @@ async function doResume() {
     readingState.paused = false;
     chrome.storage.session.set({ readingState });
   }
-  // Always recreate offscreen + re-synthesize current chunk.
-  // The offscreen may have been killed along with the service worker,
-  // and we can't reliably detect whether its audio is still alive.
+
+  // Seek-to-position resume: if the offscreen document survived AND still
+  // holds the paused Audio, just un-pause it — playback continues exactly
+  // where it stopped and the highlight re-syncs to currentTime. This avoids
+  // re-hearing the portion of the chunk that already played before pause.
+  const resumed = await sendOffscreen({ action: "resumeAudio" });
+  if (resumed && resumed.resumed) {
+    console.log("[ReadAloud] doResume: resumed existing audio in place");
+    return;
+  }
+
+  // Fallback: the offscreen (and its Audio) was torn down with the idle
+  // service worker. Recreate offscreen + re-synthesize the current chunk
+  // from its start. Less ideal (replays pre-pause audio of this chunk) but
+  // robust — there's no paused Audio to resume.
+  console.log("[ReadAloud] doResume: offscreen audio gone, re-synthesizing current chunk");
   await ensureOffscreen();
   await synthesizeAndPlayChunk();
 }
@@ -460,23 +522,60 @@ async function doResume() {
 // State is persisted to chrome.storage.session so the worker can be
 // restarted between chunks without losing progress.
 
-// Detect if text is primarily CJK (produces larger audio per character)
-function isCJK(text) {
+// Detect the dominant script of the text. Returns one of:
+//   "zh", "ja", "ko", "cjk" (ambiguous CJK, can't tell which), "other".
+// Sampled over the first 200 chars so a long page is cheap to classify.
+function detectLang(text) {
   const sample = text.substring(0, 200);
-  const cjk = (sample.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) || []).length;
-  return cjk > sample.length * 0.3;
+  if (!sample) return "other";
+  // Japanese: Hiragana/Katakana are unambiguous; CJK ideographs alone are
+  // ambiguous between zh/ja, so only flag ja when kana is present.
+  const kana = (sample.match(/[\u3040-\u30ff]/g) || []).length;
+  // Hangul is unambiguous for Korean.
+  const hangul = (sample.match(/[\uac00-\ud7af]/g) || []).length;
+  // Han ideographs (shared by zh/ja).
+  const han = (sample.match(/[\u4e00-\u9fff]/g) || []).length;
+  if (kana > 0 && kana + han > sample.length * 0.15) return "ja";
+  if (hangul > sample.length * 0.15) return "ko";
+  if (han > sample.length * 0.3) {
+    // Han without kana/hangul → most likely Chinese.
+    return "zh";
+  }
+  return "other";
 }
 
+// Detect if text is primarily CJK (produces larger audio per character).
+// Kept for callers that only need the binary CJK/non-CJK split (chunk sizing).
+function isCJK(text) {
+  const lang = detectLang(text);
+  return lang === "zh" || lang === "ja" || lang === "ko";
+}
+
+// Map a detected language to a sensible default voice.
+const DEFAULT_VOICE_BY_LANG = {
+  zh: "zh-CN-XiaoxiaoNeural",
+  ja: "ja-JP-NanamiNeural",
+  ko: "ko-KR-SunHiNeural",
+  other: "en-US-JennyNeural",
+};
+
 // Pick the right voice for the text language.
-// If user's selected voice language matches the text, use it; otherwise auto-switch.
+// If the user's selected voice matches the detected language, keep it;
+// otherwise auto-switch to a default voice for that language.
 function pickVoice(text, userVoice) {
-  const cjk = isCJK(text);
-  const voiceLang = userVoice.substring(0, 5).toLowerCase();
-  const cjkLangs = ["zh-cn", "zh-tw", "zh-hk", "ja-jp", "ko-kr"];
-  if (cjk && cjkLangs.includes(voiceLang)) return userVoice;
-  if (!cjk && !cjkLangs.includes(voiceLang)) return userVoice;
-  if (cjk) return "zh-CN-XiaoxiaoNeural";
-  return "en-US-JennyNeural";
+  const lang = detectLang(text);
+  // userVoice looks like "zh-CN-XiaoxiaoNeural"; its language family prefix
+  // is the first 2 chars (e.g. "zh", "ja", "ko", "en", "fr").
+  const userFam = (userVoice || "").substring(0, 2).toLowerCase();
+  if (lang === "other") {
+    // Non-CJK text: accept any non-CJK user voice (en/fr/de/es/...).
+    const cjkFamilies = ["zh", "ja", "ko"];
+    if (userFam && !cjkFamilies.includes(userFam)) return userVoice;
+    return DEFAULT_VOICE_BY_LANG.other;
+  }
+  // CJK text: accept a user voice whose family matches the detected CJK lang.
+  if (userFam === lang) return userVoice;
+  return DEFAULT_VOICE_BY_LANG[lang] || DEFAULT_VOICE_BY_LANG.zh;
 }
 
 // Clean text for EdgeTTS compatibility.
@@ -505,12 +604,20 @@ async function startReading(tabId, text) {
   // Detect WeRead to skip text cleaning (canvas text is already clean)
   const tab = await chrome.tabs.get(tabId);
   let isWeRead = false;
+  let isChineseAll = false;
   try {
     const host = new URL(tab?.url || "").hostname;
     isWeRead = host === "weread.qq.com" || host.endsWith(".weread.qq.com");
+    isChineseAll = host === "chineseall.cn" || host.endsWith(".chineseall.cn");
   } catch (_) { /* invalid URL */ }
 
   const useNative = await checkNative();
+  // checkNative returns true (confirmed) or null (unknown — not cached).
+  // Only treat a CONFIRMED-false (shouldn't happen now, but be safe) as a hard
+  // stop. When unknown, fall through to synthesizeAndPlayChunk: sendNative has
+  // its own retry logic and will set nativeAvailable on a real round-trip, so
+  // a transient "host not ready yet" no longer kills the whole reading session.
+  const nativeBlocked = (useNative === false);
 
   // Clean text for EdgeTTS compatibility (skip WeRead)
   const cleanedText = cleanTextForTTS(text, isWeRead);
@@ -553,7 +660,7 @@ async function startReading(tabId, text) {
 
   const voice = pickVoice(cleanedText, settings.voice);
 
-  readingState = { tabId, chunks, currentIndex: 0, cancelled: false, useNative, voice, isWeRead };
+  readingState = { tabId, chunks, currentIndex: 0, cancelled: false, useNative: !!useNative, voice, isWeRead, isChineseAll };
   activeSynthesis = { cancel() { if (readingState) readingState.cancelled = true; } };
 
   await chrome.storage.session.set({ readingState });
@@ -561,12 +668,12 @@ async function startReading(tabId, text) {
   await sendToTab(tabId, { action: "start", totalChunks: chunks.length });
   await ensureOffscreen();
 
-  if (useNative) {
+  if (nativeBlocked) {
+    console.log("[ReadAloud] startReading: native host confirmed unavailable, finishReading");
+    await finishReading();
+  } else {
     console.log("[ReadAloud] startReading: calling synthesizeAndPlayChunk, currentIndex=" + readingState.currentIndex);
     await synthesizeAndPlayChunk();
-  } else {
-    console.log("[ReadAloud] startReading: native not available, finishReading");
-    await finishReading();
   }
 }
 
@@ -579,106 +686,127 @@ async function synthesizeAndPlayChunk() {
     await finishReading(); return;
   }
 
-  const { tabId, currentIndex, voice } = readingState;
-  console.log("[ReadAloud] synthesize: currentIndex=" + currentIndex + "/" + readingState.chunks.length);
-  if (currentIndex >= readingState.chunks.length) {
-    // WeRead renders one screen at a time; "end of chunks" may just mean the
-    // current screen is done. Try turning the page and extracting more text.
-    if (readingState.isWeRead) {
-      console.log("[ReadAloud] synthesize: end of WeRead screen, turning page");
-      const r = await sendToTab(tabId, { action: "turnAndExtract" });
-      const moreText = r?.text || "";
-      if (moreText) {
-        const cjk = isCJK(moreText);
-        const more = splitText(moreText, cjk ? 300 : 1000);
-        readingState.chunks = readingState.chunks.concat(more);
-        await chrome.storage.session.set({ readingState });
-        console.log("[ReadAloud] synthesize: turned page, +" + more.length + " chunks, continuing");
-        // currentIndex now points at the first new chunk; fall through to synthesize it.
-      } else {
-        console.log("[ReadAloud] synthesize: no more pages, finishReading");
-        await finishReading(); return;
-      }
-    } else {
-      console.log("[ReadAloud] synthesize: reached end of chunks, finishReading");
-      await finishReading(); return;
-    }
-  }
+  const { tabId, voice } = readingState;
+  console.log("[ReadAloud] synthesize: currentIndex=" + readingState.currentIndex + "/" + readingState.chunks.length);
 
   const rate = rateToStr(settings.rate);
 
-  try {
-    let resp;
-    if (nextChunkCache && nextChunkCache.index === currentIndex &&
-        nextChunkCache.voice === voice && nextChunkCache.rate === rate) {
-      console.log("[ReadAloud] synthesize: using cache for chunk " + currentIndex);
-      resp = nextChunkCache;
-      nextChunkCache = null;
-    } else {
-      nextChunkCache = null;
-      console.log("[ReadAloud] synthesize: sending to native, chunk " + currentIndex + " len=" + readingState.chunks[currentIndex].length);
-      resp = await sendNative({
-        action: "synthesize",
-        text: readingState.chunks[currentIndex],
-        voice: voice,
-        rate: rate,
-      });
-      console.log("[ReadAloud] synthesize: native returned, audioLen=" + (resp.audio?.length || 0) + " boundaries=" + (resp.boundaries?.length || 0));
-    }
-
+  // Loop so that empty-audio chunks (punctuation/whitespace-only) advance
+  // without recursion — a long run of silent chunks used to grow an unbounded
+  // promise chain. `break` exits on any terminal path; the only re-entry is
+  // the empty-audio continue.
+  while (true) {
     if (!readingState || readingState.cancelled) {
-      console.log("[ReadAloud] synthesize: readingState gone after native, finishReading");
+      console.log("[ReadAloud] synthesize: no readingState/cancelled, finishReading");
       await finishReading(); return;
     }
-    if (resp.audio === undefined || resp.audio === null) {
-      console.log("[ReadAloud] synthesize: no audio in response, treating as error");
-      throw new Error("No audio in response");
+    // Re-read currentIndex/voice each iteration: the empty-audio path bumps it.
+    const curIndex = readingState.currentIndex;
+    const curVoice = readingState.voice;
+
+    if (curIndex >= readingState.chunks.length) {
+      if (readingState.isChineseAll) {
+        console.log("[ReadAloud] synthesize: end of ChineseAll page, turning page");
+        const r = await sendToTab(tabId, { action: "turnAndExtract" });
+        const moreText = r?.text || "";
+        if (moreText) {
+          const cjk = isCJK(moreText);
+          const more = splitText(moreText, cjk ? 300 : 1000);
+          readingState.chunks = readingState.chunks.concat(more);
+          await chrome.storage.session.set({ readingState });
+          console.log("[ReadAloud] synthesize: turned page, +" + more.length + " chunks, continuing");
+          continue;
+        }
+      }
+      console.log("[ReadAloud] synthesize: end of chunks, finishReading");
+      await finishReading(); return;
     }
 
-    // Empty audio (Edge TTS returns "" for punctuation-only / whitespace
-    // chunks): a zero-length Audio won't fire onended, which would deadlock
-    // playback waiting for audioEnded that never comes. Skip playback
-    // entirely and advance immediately, same as a normal audioEnded.
-    if (resp.audio.length === 0) {
-      console.log("[ReadAloud] synthesize: empty audio for chunk " + currentIndex + ", skipping playback");
-      readingState.currentIndex++;
-      await chrome.storage.session.set({ readingState });
-      await synthesizeAndPlayChunk();
+    try {
+      let resp;
+      if (nextChunkCache && nextChunkCache.index === curIndex &&
+          nextChunkCache.voice === curVoice && nextChunkCache.rate === rate) {
+        console.log("[ReadAloud] synthesize: using cache for chunk " + curIndex);
+        resp = nextChunkCache;
+        nextChunkCache = null;
+        pregenPromise = null;
+      } else if (pregenPromise && pregenIndex === curIndex &&
+                 pregenVoice === curVoice && pregenRate === rate) {
+        console.log("[ReadAloud] synthesize: awaiting in-flight pregen for chunk " + curIndex);
+        resp = await pregenPromise;
+        pregenPromise = null;
+        nextChunkCache = null;
+        if (!resp || resp.audio === undefined) {
+          throw new Error("Pregeneration failed for chunk " + curIndex);
+        }
+      } else {
+        nextChunkCache = null;
+        pregenPromise = null;
+        console.log("[ReadAloud] synthesize: sending to native, chunk " + curIndex + " len=" + readingState.chunks[curIndex].length);
+        resp = await sendNative({
+          action: "synthesize",
+          text: readingState.chunks[curIndex],
+          voice: curVoice,
+          rate: rate,
+        });
+        console.log("[ReadAloud] synthesize: native returned, audioLen=" + (resp.audio?.length || 0) + " boundaries=" + (resp.boundaries?.length || 0));
+      }
+
+      if (!readingState || readingState.cancelled) {
+        console.log("[ReadAloud] synthesize: readingState gone after native, finishReading");
+        await finishReading(); return;
+      }
+      if (resp.audio === undefined || resp.audio === null) {
+        console.log("[ReadAloud] synthesize: no audio in response, treating as error");
+        throw new Error("No audio in response");
+      }
+
+      // Empty audio (Edge TTS returns "" for punctuation-only / whitespace
+      // chunks): a zero-length Audio won't fire onended, which would deadlock
+      // playback waiting for audioEnded that never comes. Skip playback,
+      // advance, and loop to the next chunk (no recursion).
+      if (resp.audio.length === 0) {
+        console.log("[ReadAloud] synthesize: empty audio for chunk " + curIndex + ", skipping playback");
+        readingState.currentIndex++;
+        await chrome.storage.session.set({ readingState });
+        continue;
+      }
+
+      console.log("[ReadAloud] synthesize: sending highlight + playAudio for chunk " + curIndex);
+      await sendToTab(tabId, {
+        action: "highlight",
+        text: readingState.chunks[curIndex],
+        boundaries: resp.boundaries || [],
+      });
+
+      // Check playAudio's response: if offscreen is dead or play() rejected,
+      // audioEnded will never arrive and playback would hang silently. Throw so
+      // the catch below retries via consecutiveErrors instead of stalling.
+      const playResp = await sendOffscreen({ action: "playAudio", audioBase64: resp.audio, boundaries: resp.boundaries || [] });
+      if (playResp.error) {
+        throw new Error("playAudio: " + playResp.error);
+      }
+
+      consecutiveErrors = 0;
+      pregenerateNextChunk(curIndex + 1, curVoice, rate);
+      break;  // playback started; audioEnded event drives the next chunk
+
+    } catch (err) {
+      consecutiveErrors++;
+      console.warn("[ReadAloud] synthesize: chunk " + curIndex + " failed (" + consecutiveErrors + " consecutive):", err.message);
+      if (consecutiveErrors >= 3) {
+        console.error("[ReadAloud] synthesize: too many consecutive errors, finishReading");
+        await finishReading();
+        return;
+      }
+      if (readingState) {
+        readingState.currentIndex++;
+        await chrome.storage.session.set({ readingState });
+        continue;  // retry next chunk within the loop (no recursion)
+      }
       return;
     }
-
-    console.log("[ReadAloud] synthesize: sending highlight + playAudio for chunk " + currentIndex);
-    await sendToTab(tabId, {
-      action: "highlight",
-      text: readingState.chunks[currentIndex],
-      boundaries: resp.boundaries || [],
-    });
-
-    // Check playAudio's response: if offscreen is dead or play() rejected,
-    // audioEnded will never arrive and playback would hang silently. Throw so
-    // the catch below retries via consecutiveErrors instead of stalling.
-    const playResp = await sendOffscreen({ action: "playAudio", audioBase64: resp.audio, boundaries: resp.boundaries || [] });
-    if (playResp.error) {
-      throw new Error("playAudio: " + playResp.error);
-    }
-
-    consecutiveErrors = 0;
-    pregenerateNextChunk(currentIndex + 1, voice, rate);
-
-  } catch (err) {
-    consecutiveErrors++;
-    console.warn("[ReadAloud] synthesize: chunk " + currentIndex + " failed (" + consecutiveErrors + " consecutive):", err.message);
-    if (consecutiveErrors >= 3) {
-      console.error("[ReadAloud] synthesize: too many consecutive errors, finishReading");
-      await finishReading();
-      return;
-    }
-    if (readingState) {
-      readingState.currentIndex++;
-      await chrome.storage.session.set({ readingState });
-      await synthesizeAndPlayChunk();
-    }
-  }
+  }  // end while
 }
 
 // Pre-generate the next chunk in the background so playback is gapless.
@@ -687,17 +815,20 @@ function pregenerateNextChunk(nextIndex, voice, rate) {
   if (nextIndex >= readingState.chunks.length) return;
 
   const myId = ++pregenId;
-  sendNative({
+  pregenIndex = nextIndex;
+  pregenVoice = voice;
+  pregenRate = rate;
+
+  pregenPromise = sendNative({
     action: "synthesize",
     text: readingState.chunks[nextIndex],
     voice: voice,
     rate: rate,
   }).then((resp) => {
     // Discard if a newer pre-generation was started (voice/rate change)
-    if (myId !== pregenId) return;
+    if (myId !== pregenId) return null;
     // Only cache if still relevant (user hasn't stopped or moved past)
-    if (readingState && !readingState.cancelled &&
-        readingState.currentIndex === nextIndex - 1) {
+    if (readingState && !readingState.cancelled) {
       nextChunkCache = {
         index: nextIndex,
         audio: resp.audio,
@@ -706,9 +837,12 @@ function pregenerateNextChunk(nextIndex, voice, rate) {
         rate,
       };
     }
+    return resp;
   }).catch((err) => {
-    // Pre-generation failure is non-critical; will synthesize on demand instead
-    console.warn("[ReadAloud] Pre-generate chunk", nextIndex + 1, "failed:", err.message);
+    if (myId === pregenId) {
+      console.warn("[ReadAloud] Pre-generate chunk", nextIndex, "failed:", err.message);
+    }
+    return null;
   });
 }
 
@@ -756,6 +890,9 @@ async function finishReading() {
   const tabId = readingState?.tabId || currentTabId;
   readingState = null;
   nextChunkCache = null;
+  pregenPromise = null;
+  pregenIndex = -1;
+  pregenId++;
   activeSynthesis = null;
   currentTabId = null;
   paused = false;
@@ -770,6 +907,9 @@ async function stopReading(tabId) {
   const oldTabId = currentTabId;
   if (readingState) readingState.cancelled = true;
   nextChunkCache = null;
+  pregenPromise = null;
+  pregenIndex = -1;
+  pregenId++;
   if (activeSynthesis) { activeSynthesis.cancel(); activeSynthesis = null; }
   paused = false;
   currentTabId = null;
@@ -784,6 +924,8 @@ async function stopReading(tabId) {
 // ---- Utilities ----
 
 function splitText(text, maxLen) {
+  // Empty / whitespace-only input → no chunks (caller bails before any native call).
+  if (!text || !text.trim()) return [];
   if (text.length <= maxLen) return [text];
   const chunks = [];
   // Split on ASCII and CJK sentence terminators
@@ -794,10 +936,25 @@ function splitText(text, maxLen) {
       chunks.push(cur.trim());
       cur = "";
     }
-    // If a single sentence still exceeds maxLen, hard-split it
+    // If a single sentence still exceeds maxLen, hard-split it. Step by code
+    // points so a UTF-16 surrogate pair (emoji/astral char) is never split in
+    // half — a lone surrogate produces broken text for Edge TTS.
     if (s.length > maxLen) {
-      for (let i = 0; i < s.length; i += maxLen) {
-        chunks.push(s.substring(i, i + maxLen).trim());
+      let i = 0;
+      while (i < s.length) {
+        let end = i + maxLen;
+        if (end >= s.length) {
+          end = s.length;
+        } else if (end > i + 1) {
+          // If the cut would land on a low surrogate, back up one so the
+          // pair stays whole. Guarded by end > i+1 so we never produce an
+          // empty chunk when the high surrogate sits right at the boundary.
+          const code = s.charCodeAt(end - 1);
+          if (code >= 0xD800 && code <= 0xDBFF) end -= 1;
+        }
+        const piece = s.substring(i, end).trim();
+        if (piece) chunks.push(piece);
+        i = end;
       }
     } else {
       cur += s;

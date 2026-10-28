@@ -77,8 +77,13 @@ chrome.runtime.sendMessage({ action: "getActualVoice" }, (r) => {
     if (voice && actualVoice) {
       chrome.runtime.sendMessage({ action: "checkVoiceCompatible", voice }, (cr) => {
         if (cr && !cr.compatible) {
-          const msg = cr.textLang === "cjk" ? "中文文本需要中文语音，请在下拉框中切换" : "English text requires English voice, please switch";
-          setStatus(msg, "error");
+          const langMsgs = {
+            zh: "中文文本需要中文语音，请在下拉框中切换",
+            ja: "日本語のテキストには日本語音声が必要です",
+            ko: "한국어 텍스트에는 한국어 음성이 필요합니다",
+            other: "This text requires a non-CJK voice — please switch",
+          };
+          setStatus(langMsgs[cr.textLang] || "Voice does not match the text language", "error");
         }
       });
     }
@@ -185,8 +190,13 @@ voiceSelect.addEventListener("change", () => {
       chrome.runtime.sendMessage({ action: "getActualVoice" }, (v) => {
         if (v && v.voice) {
           voiceSelect.value = v.voice;
-          const msg = r.textLang === "cjk" ? "中文文本需要中文语音" : "English text requires English voice";
-          setStatus(msg, "error");
+          const langMsgs = {
+            zh: "中文文本需要中文语音",
+            ja: "日本語のテキストには日本語音声が必要です",
+            ko: "한국어 텍스트에는 한국어 음성이 필요합니다",
+            other: "This text requires a non-CJK voice",
+          };
+          setStatus(langMsgs[r.textLang] || "Voice does not match the text language", "error");
         }
       });
       return;
@@ -219,18 +229,23 @@ btnSelection.addEventListener("click", () => {
 });
 
 btnPause.addEventListener("click", () => {
-  const isPaused = btnPause.textContent === "Resume";
-  const action = isPaused ? "resume" : "pause";
-  chrome.runtime.sendMessage({ action }, () => {
-    if (isPaused) {
-      btnPause.textContent = "Pause";
-      btnPause.className = "btn btn-pause";
-      setStatus("Reading...", "info");
-    } else {
-      btnPause.textContent = "Resume";
-      btnPause.className = "btn btn-resume";
-      setStatus("Paused");
-    }
+  // Derive the current state from the authoritative background value, not the
+  // button's textContent — those desync after a service-worker restart resets
+  // `paused` to false while the popup still shows "Resume".
+  chrome.runtime.sendMessage({ action: "getStatus" }, (status) => {
+    const isPaused = !!(status && status.paused);
+    const action = isPaused ? "resume" : "pause";
+    chrome.runtime.sendMessage({ action }, () => {
+      if (isPaused) {
+        btnPause.textContent = "Pause";
+        btnPause.className = "btn btn-pause";
+        setStatus("Reading...", "info");
+      } else {
+        btnPause.textContent = "Resume";
+        btnPause.className = "btn btn-resume";
+        setStatus("Paused");
+      }
+    });
   });
 });
 

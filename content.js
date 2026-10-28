@@ -27,12 +27,26 @@
 
   // ---- SPA route change detection ----
   let lastUrl = location.href;
+  let lastChineseAllPage = null;
+  let isAutoTurning = false;
+
   setInterval(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       try { chrome.runtime.sendMessage({ action: "urlChanged" }); } catch (_) {}
+    } else if (!isAutoTurning && (location.hostname === "chineseall.cn" || location.hostname.endsWith(".chineseall.cn") || document.querySelector("read-pdf, sx-book-read"))) {
+      const activeSlide = document.querySelector(".reader-swiper .swiper-slide-active, .swiper-slide.swiper-slide-active");
+      const pageIndicator = document.querySelector(".page-right, .page.ignore")?.innerText;
+      const currentKey = (activeSlide?.id || "") + ":" + (pageIndicator || "");
+      if (lastChineseAllPage !== null && currentKey !== lastChineseAllPage) {
+        lastChineseAllPage = currentKey;
+        console.log("[ReadAloud] ChineseAll page changed manually:", currentKey);
+        try { chrome.runtime.sendMessage({ action: "urlChanged" }); } catch (_) {}
+      } else {
+        lastChineseAllPage = currentKey;
+      }
     }
-  }, 1500);
+  }, 1000);
 
   // ---- Message handling ----
 
@@ -108,6 +122,18 @@
           case "getPageText":
             sendResponse({ text: extractDoubanText() });
             return false;
+        }
+      }
+
+      // ---- ChineseAll (书香中国): early return for text extraction and continuous reading ----
+      if (host === "chineseall.cn" || host.endsWith(".chineseall.cn") || document.querySelector("read-pdf, sx-book-read")) {
+        switch (msg.action) {
+          case "getPageText":
+            sendResponse({ text: extractChineseAllText() });
+            return false;
+          case "turnAndExtract":
+            turnChineseAllAndExtract().then(text => sendResponse({ text }));
+            return true;
         }
       }
 
@@ -527,6 +553,80 @@
     }
     if (parts.length > 0) return parts.join("\n");
     return extractPageText(); // fallback
+  }
+
+  // ---- ChineseAll (书香中国): text extraction & continuous reading ----
+
+  function extractChineseAllText() {
+    const swiper = document.querySelector(".reader-swiper");
+    if (swiper) {
+      const swiperRect = swiper.getBoundingClientRect();
+      const slides = Array.from(swiper.querySelectorAll(".swiper-slide"));
+      // In 1-page or 2-page view, extract only the slides currently visible on screen
+      const visibleSlides = slides.filter(s => {
+        const r = s.getBoundingClientRect();
+        return r.right > swiperRect.left + 10 && r.left < swiperRect.right - 10 && r.width > 0;
+      });
+
+      if (visibleSlides.length > 0) {
+        const texts = visibleSlides.map(s => {
+          const tl = s.querySelector(".textLayer");
+          return tl ? extractInnerText(tl) : "";
+        }).filter(Boolean);
+        if (texts.length > 0) {
+          console.log("[ReadAloud] chineseall: extracted " + texts.length + " visible slide(s), total len=" + texts.join("\n").length);
+          return texts.join("\n");
+        }
+      }
+
+      // Fallback: active slide
+      const activeSlide = swiper.querySelector(".swiper-slide-active");
+      if (activeSlide) {
+        const tl = activeSlide.querySelector(".textLayer");
+        if (tl) {
+          const text = extractInnerText(tl);
+          if (text) {
+            console.log("[ReadAloud] chineseall: extracted active slide text len=" + text.length);
+            return text;
+          }
+        }
+      }
+      return "";
+    }
+
+    // Fallback if not a Swiper reader (e.g. EPUB or other formats)
+    console.log("[ReadAloud] chineseall: fallback to extractPageText");
+    return extractPageText();
+  }
+
+  // Turn to the next page on ChineseAll and extract text.
+  async function turnChineseAllAndExtract() {
+    const nextBtn = Array.from(document.querySelectorAll(".menu-pager-button")).find(b => b.innerText.includes("下一页"));
+    if (!nextBtn || nextBtn.classList.contains("disabled")) {
+      console.log("[ReadAloud] chineseall: nextBtn not found or disabled (end of book)");
+      return "";
+    }
+    const curActiveId = document.querySelector(".swiper-slide-active")?.id;
+    isAutoTurning = true;
+    try {
+      nextBtn.click();
+
+      // Wait for active slide to change and textLayer to render
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < 4000) {
+        await new Promise(r => setTimeout(r, 200));
+        const newActive = document.querySelector(".swiper-slide-active");
+        if (newActive && newActive.id !== curActiveId) {
+          const pageIndicator = document.querySelector(".page-right, .page.ignore")?.innerText;
+          lastChineseAllPage = (newActive.id || "") + ":" + (pageIndicator || "");
+          const text = extractChineseAllText();
+          if (text) return text;
+        }
+      }
+    } finally {
+      setTimeout(() => { isAutoTurning = false; }, 500);
+    }
+    return "";
   }
 
   // ---- Text Extraction (Strategy Chain) for non-WeRead sites ----

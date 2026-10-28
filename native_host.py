@@ -1,4 +1,4 @@
-#!/Users/cosmos/miniconda3/bin/python3
+#!/Users/cosmos/miniconda3/bin/python3 -B
 """
 ReadAloud - Native Messaging Host
 Uses edge-tts to synthesize speech with Edge Neural voices.
@@ -7,6 +7,10 @@ Chrome launches this automatically on demand via Native Messaging.
 
 import sys
 import os
+
+# Prevent creating __pycache__ inside the Chrome extension directory
+sys.dont_write_bytecode = True
+
 import struct
 import json
 import asyncio
@@ -177,16 +181,11 @@ async def main_loop():
                     current_task.cancel()
             break
 
-        # Only a new synthesis request is allowed to preempt an in-flight one.
-        # Lightweight messages (ping/getVoices) must NOT cancel synthesis:
-        # background.js uses one-shot sendNativeMessage, and a cancelled
-        # synthesis emits {"error":"cancelled"} which Chrome routes (FIFO) to
-        # the earliest pending callback — often the main playback request,
-        # making it appear to fail and aborting playback. ping/getVoices are
-        # cheap and run alongside the synthesis task.
+        # Process requests in strict FIFO order so stdout messages pair 1:1
+        # with Chrome's sendNativeMessage callback queue without misrouting.
         action = msg.get("action", "")
-        if action == "synthesize" and current_task is not None and not current_task.done():
-            current_task.cancel()
+        if current_task is not None and not current_task.done():
+            await current_task
 
         current_task = asyncio.create_task(_handle_and_respond(msg))
 

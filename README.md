@@ -6,10 +6,10 @@ Uses [edge-tts](https://github.com/rany2/edge-tts) via native messaging — not 
 
 ## Features
 
-- **Word-by-word highlighting** — synced with audio via a 60 ms timer driven by `audio.currentTime`
+- **Word-by-word highlighting** — synced with audio via a 60 ms timer driven by `audio.currentTime`, with high-contrast warm yellow styling
 - **Neural voices** — any voice Microsoft Edge TTS exposes (fetched live at runtime; the popup lists whatever the host returns)
-- **Special-site extraction** — built-in support for WeRead (微信读书, canvas-based), QQ Reading, Tianya, and Douban
-- **Single-section reading (WeRead)** — reads one section at a time (title → next title), then stops; start the next section from the table of contents
+- **Special-site extraction** — built-in support for WeRead (微信读书, canvas-based), ChineseAll (书香中国, Swiper + PDF.js), QQ Reading, Tianya, and Douban
+- **Continuous reading across pages** — automatic page-turn for ChineseAll (书香中国) and single-section reading for WeRead
 - **Speed control** — 0.5x to 2.0x
 - **Voice auto-switching** — picks a voice matching the page's detected language (Chinese / Japanese / Korean / other)
 - **Keyboard shortcuts** — Alt+R start/pause/resume, Alt+S stop
@@ -97,6 +97,7 @@ Some sites have dedicated extractors that bypass the strategy chain. All except 
 | Site (`host`) | Method | Highlighting |
 |---|---|---|
 | **WeRead** (`weread.qq.com`) | Canvas `fillText` interception + per-character coordinate overlay. Injects `weread-hook.js` into the MAIN world to intercept `CanvasRenderingContext2D.fillText`, capturing each char's text, x/y, font size, and fill color. Reads **one section at a time** (see below). | Custom canvas overlay positioned by per-char x/y |
+| **ChineseAll** (`chineseall.cn`, `*.chineseall.cn`) | Active slide (`.swiper-slide-active .textLayer`) or visible viewport slides in Swiper PDF reader. Bypasses `.content` to prevent reading earlier chapters. Supports continuous auto page-turning (`turnAndExtract`) via the native pager button and detects manual chapter jumps without URL changes. | Generic (DOM word-wrapping in PDF.js text layer) |
 | **QQ Reading** (`book.qq.com`) | `#article` | Generic (DOM word-wrapping) |
 | **Tianya** (`tianya.net`) | `h1.post-title` + `.post-rich-text-body` | Generic |
 | **Douban** (`www.douban.com`) | `.note-header h1` + `#link-report .note` | Generic |
@@ -115,6 +116,14 @@ WeRead renders text onto canvases in page-reader mode, keeping only 2 canvases i
 - Canvas chars feed the per-character overlay highlighter.
 
 **DOM fallback** (sections where no canvas char has screenY ≥ 0): extracts text from `.readerChapterContent`'s absolutely-positioned `<span data-wr-role=text>` elements (vertical layout), sorted by Y then X. Reads from the first visible span onward with a simple chapter-level highlight. No section boundaries on the DOM path — the user stops manually via Alt+S.
+
+### Continuous Reading & Page-Turn (ChineseAll / 书香中国)
+
+ChineseAll (`chineseall.cn`) is an Angular SPA that uses Swiper to display PDF books rendered via PDF.js.
+
+- **Scoped Slide Extraction**: All rendered slides reside within an outer `<div class="content">`. A generic DOM query would start from `#page_1`/`#page_2` (Chapter 1) regardless of the chapter selected in the table of contents. `extractChineseAllText` isolates only the currently active slide (`.swiper-slide-active`) and any viewport-intersecting slides (for dual-page view), reading only from the user's current location.
+- **Continuous Auto Page-Turn**: Because each PDF page is relatively short (~500–900 characters), reading stops when chunks run out unless continuous reading is active. When the current page finishes, `background.js` requests `turnAndExtract`, which triggers the reader's native `.menu-pager-button` ("下一页"), waits for the new page's `.textLayer` to render, appends the new chunks, and continues playback gaplessly.
+- **SPA Chapter Change Detection**: Navigating between pages or clicking chapters in the directory does not change `location.href`. An active polling loop tracks the active slide ID and page indicator (`X/Y`), immediately sending `urlChanged` on manual navigation to stop outdated audio.
 
 ### Language Detection & Voices
 

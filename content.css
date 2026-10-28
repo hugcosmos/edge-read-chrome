@@ -7,13 +7,14 @@
 }
 
 .readaloud-active-word {
-  background-color: #d3e3fd !important;
+  background-color: #ffe082 !important;
   color: #1a1a1a !important;
-  box-shadow: 0 1px 4px rgba(26, 115, 232, 0.15);
+  box-shadow: 0 1px 4px rgba(255, 179, 0, 0.4);
+  outline: 1.5px solid #ffb300 !important;
 }
 
 /* Paragraph-level fallback (used when no boundaries available) */
 .readaloud-active {
-  background-color: #e8f0fe !important;
+  background-color: #fff9c4 !important;
   border-radius: 4px;
 }
